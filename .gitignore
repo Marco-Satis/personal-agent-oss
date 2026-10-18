@@ -17,3 +17,7 @@ __pycache__/
 .venv/
 build/
 dist/
+
+# Private Claude/Marco working files (contain personal setup details)
+CLAUDE.md
+PROGRESS.md
