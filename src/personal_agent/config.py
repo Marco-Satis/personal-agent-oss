@@ -6,7 +6,10 @@ file inside the repository. See `.env.example` for the full list.
 
 from __future__ import annotations
 
+import ipaddress
+import math
 import os
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,6 +35,19 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} must be a finite number")
+    return value
+
+
 def _parse_quiet_hours(raw: str | None) -> tuple[int, int] | None:
     """Parse "23-7" into (23, 7). None or empty disables quiet hours."""
     if not raw:
@@ -43,6 +59,66 @@ def _parse_quiet_hours(raw: str | None) -> tuple[int, int] | None:
     if not (0 <= start <= 23 and 0 <= end <= 23):
         raise ConfigError("PA_QUIET_HOURS hours must be between 0 and 23")
     return start, end
+
+
+WEBHOOK_HOSTS = ("discord.com", "discordapp.com")
+
+
+def _parse_webhook(raw: str | None) -> str | None:
+    """The Discord webhook URL. Error messages never contain the value."""
+    if not raw:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = parts.hostname
+    except ValueError as exc:
+        raise ConfigError("PA_DISCORD_WEBHOOK is not a valid URL") from exc
+    if parts.scheme != "https":
+        raise ConfigError("PA_DISCORD_WEBHOOK must be an https:// URL")
+    if host not in WEBHOOK_HOSTS or not parts.path.startswith("/api/webhooks/"):
+        raise ConfigError("PA_DISCORD_WEBHOOK must be a Discord webhook URL (https://discord.com/api/webhooks/...)")
+    return raw
+
+
+def _parse_public_approval_url(raw: str | None) -> str | None:
+    """Base URL of the approval page as the phone sees it; https is added when missing."""
+    if not raw:
+        return None
+    if raw.lower().startswith("http://"):
+        raise ConfigError("PA_PUBLIC_APPROVAL_URL must use https")
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = parts.hostname
+    except ValueError as exc:
+        raise ConfigError("PA_PUBLIC_APPROVAL_URL is not a valid URL") from exc
+    if parts.scheme != "https" or not host or parts.query or parts.fragment or parts.username:
+        raise ConfigError("PA_PUBLIC_APPROVAL_URL must look like https://host[/prefix]")
+    return raw.rstrip("/")
+
+
+def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Extra client networks allowed on /escalate and /internal/ (loopback always is).
+
+    Needed when `serve` runs in a container: published ports reach it from the
+    bridge gateway (e.g. 172.17.0.1), not from loopback.
+    """
+    if not raw:
+        return ()
+    networks = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            network = ipaddress.ip_network(part, strict=False)
+        except ValueError as exc:
+            raise ConfigError("PA_TRUSTED_CLIENTS must be a comma-separated list of IP networks") from exc
+        if network.prefixlen == 0 or not network.is_private:
+            raise ConfigError("PA_TRUSTED_CLIENTS may only name private or loopback networks, not all addresses")
+        networks.append(network)
+    return tuple(networks)
 
 
 def _optional_path(name: str) -> Path | None:
@@ -85,6 +161,19 @@ class Config:
     workdir: Path | None = None
     claude_config_dir: Path | None = None
     claude_oauth_token: str | None = field(default=None, repr=False)
+    approval_timeout_s: int = 300
+    quota_stop: float = 0.9
+    router_small_model: str | None = "haiku"
+    router_small_max_chars: int = 160
+    discord_webhook: str | None = field(default=None, repr=False)
+    public_approval_url: str | None = None
+    approval_pin: str | None = field(default=None, repr=False)
+    trusted_clients: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+
+    @property
+    def remote_approvals(self) -> bool:
+        """Whether `serve` offers approvals from the phone (notice plus one-time link)."""
+        return bool(self.discord_webhook and self.public_approval_url)
 
     def bridge_paths(self) -> tuple[Path, Path]:
         """Working directory and Claude Code config directory for the assistant."""
@@ -114,6 +203,22 @@ class Config:
                 )
             twilio = TwilioConfig(sid, token, from_number)
 
+        approval_timeout_s = _env_int("PA_APPROVAL_TIMEOUT_S", 300)
+        if not 10 <= approval_timeout_s <= 3600:
+            raise ConfigError("PA_APPROVAL_TIMEOUT_S must be between 10 and 3600 seconds")
+        quota_stop = _env_float("PA_QUOTA_STOP", 0.9)
+        if not 0 < quota_stop <= 1:
+            raise ConfigError("PA_QUOTA_STOP must be greater than 0 and at most 1 (e.g. 0.9)")
+        small_model = _env("PA_ROUTER_SMALL_MODEL", "haiku")
+        if small_model is not None and small_model.lower() in ("off", "none", "0"):
+            small_model = None
+        small_max_chars = _env_int("PA_ROUTER_SMALL_MAX_CHARS", 160)
+        if not 20 <= small_max_chars <= 2000:
+            raise ConfigError("PA_ROUTER_SMALL_MAX_CHARS must be between 20 and 2000")
+        approval_pin = _env("PA_APPROVAL_PIN")
+        if approval_pin is not None:
+            validate_pin(approval_pin, "PA_APPROVAL_PIN")
+
         return cls(
             state_dir=state_dir,
             status_dir=status_dir,
@@ -136,6 +241,14 @@ class Config:
             workdir=_optional_path("PA_WORKDIR"),
             claude_config_dir=_optional_path("PA_CLAUDE_CONFIG_DIR"),
             claude_oauth_token=_env("CLAUDE_CODE_OAUTH_TOKEN"),
+            approval_timeout_s=approval_timeout_s,
+            quota_stop=quota_stop,
+            router_small_model=small_model,
+            router_small_max_chars=small_max_chars,
+            discord_webhook=_parse_webhook(_env("PA_DISCORD_WEBHOOK")),
+            public_approval_url=_parse_public_approval_url(_env("PA_PUBLIC_APPROVAL_URL")),
+            approval_pin=approval_pin,
+            trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),
         )
 
     def validate_for_serve(self) -> None:
@@ -147,8 +260,12 @@ class Config:
         validate_pin(self.call_pin)
         if self.provider == "twilio" and not (self.public_url or "").startswith("https://"):
             raise ConfigError("PA_PUBLIC_URL must be an https:// URL when using Twilio")
+        if bool(self.discord_webhook) != bool(self.public_approval_url):
+            raise ConfigError("set PA_DISCORD_WEBHOOK and PA_PUBLIC_APPROVAL_URL together, or neither")
+        if self.remote_approvals:
+            validate_pin(self.approval_pin, "PA_APPROVAL_PIN")
 
 
-def validate_pin(pin: str | None) -> None:
-    if not pin or not pin.isdigit() or len(pin) < 6:
-        raise ConfigError("PA_CALL_PIN must be at least 6 digits")
+def validate_pin(pin: str | None, name: str = "PA_CALL_PIN") -> None:
+    if not pin or not pin.isascii() or not pin.isdigit() or len(pin) < 6:
+        raise ConfigError(f"{name} must be at least 6 digits")

@@ -156,5 +156,5 @@ def test_chat_cli_with_fake(tmp_path, fake_bin, monkeypatch, capsys):
     monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
     assert main(["chat"]) == 0
     out = capsys.readouterr().out
-    assert "agent> echo: hello" in out
+    assert "agent[3]> echo: hello" in out
     assert os.path.isdir(tmp_path / "state" / "workspace")
