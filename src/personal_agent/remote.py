@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import __version__
-from .approval import CONFIRM_WORD, CONTEXT_HINT, LEVEL_LABELS, ApprovalRequest, Level
+from .approval import CONFIRM_WORD, CONTEXT_HINT, LEVEL_LABELS, ApprovalRequest, Level, approval_header
 from .status import clean_text
 
 log = logging.getLogger(__name__)
@@ -405,6 +405,7 @@ class RemoteChannel:
         opener: Callable | None = None,
         poll_s: int = 2,  # short polls: a stop is noticed (and cancelled) within the broker's close join
         stop: Callable[[], bool] | None = None,
+        stop_for: Callable[[ApprovalRequest], bool] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._token = api_token
@@ -413,6 +414,21 @@ class RemoteChannel:
         self._opener = opener or local_opener()
         self.poll_s = poll_s
         self._stop = stop or (lambda: False)
+        self._stop_for = stop_for
+
+    def _stopped(self, request: ApprovalRequest) -> bool:
+        return self._stop() or (self._stop_for is not None and self._stop_for(request))
+
+    @staticmethod
+    def page_summary(request: ApprovalRequest) -> str:
+        """What the approval page shows: who asks first, then the context hint and the request."""
+        lines = [approval_header(request)]
+        if request.origin:
+            lines.append(f"task: {request.origin}")
+        if request.context:
+            lines.append(f"({request.context}: {CONTEXT_HINT})")
+        lines.append(request.summary)
+        return "\n".join(lines)
 
     def __repr__(self) -> str:
         return f"RemoteChannel({self.base_url!r})"
@@ -446,6 +462,10 @@ class RemoteChannel:
         remaining = int(deadline - time.monotonic())
         if remaining <= EXPIRY_MARGIN_S:
             return False
+        summary = self.page_summary(request)
+        if len(summary) > 2000:
+            self._note(f"[approval for {request.tool_name} is too large to review remotely: denied]")
+            return False
         approval_id: str | None = None
         state = "pending"
         try:
@@ -453,8 +473,7 @@ class RemoteChannel:
                 "POST",
                 "/internal/approvals",
                 {"tool_name": request.tool_name, "level": int(request.level),
-                 "summary": (f"({request.context}: {CONTEXT_HINT})\n"
-                             if request.context else "") + request.summary,
+                 "summary": summary,
                  "timeout_s": remaining},
                 # The server posts the notice before it answers. Wait as long as the entry
                 # can live: if this call gives up, the entry it may have created has expired.
@@ -468,9 +487,10 @@ class RemoteChannel:
                 self._note(f"[remote approval not available (HTTP {status}): denied]")
                 return False
             approval_id = candidate
-            self._note(f"[approval pending remotely: {request.tool_name} (level {int(request.level)}), link sent]")
+            self._note(f"[approval pending remotely · {request.scope_label}: {request.tool_name} "
+                       f"(level {int(request.level)}), link sent]")
             while state == "pending":
-                if self._stop():
+                if self._stopped(request):
                     break
                 left = deadline - time.monotonic()
                 if left <= 0:

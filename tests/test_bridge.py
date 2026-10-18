@@ -69,7 +69,11 @@ def test_args_always_disable_hooks_and_ask_for_skills(tmp_path):
     assert args[index + 1] == "--settings"
     settings = json.loads(args[index + 2])
     assert args[index + 2] == HARDENED_SETTINGS
-    assert settings == {"disableAllHooks": True, "permissions": {"ask": ["Skill"]}}
+    assert args[index + 2] == (
+        '{"disableAllHooks":true,"crossSessionInbound":"refuse","permissions":'
+        '{"ask":["Skill","mcp__pa__delegate_task"],"deny":["SendMessage","ListAgents","Task","Agent"]}}'
+    )
+    assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents", "Task", "Agent"]
     assert args[args.index("--tools") + 1] == ""
 
 
@@ -182,3 +186,111 @@ def test_chat_cli_with_fake(tmp_path, fake_bin, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "agent[3]> echo: hello" in out
     assert os.path.isdir(tmp_path / "state" / "vault")
+
+
+# --- phase 3: extra tools, turn limit, abort, out-of-turn output ------------------------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from personal_agent.bridge import UnexpectedOutput  # noqa: E402
+
+
+def test_extra_tools_are_not_passed_to_tools_and_max_turns(tmp_path):
+    cfg = BridgeConfig(workdir=tmp_path, config_dir=tmp_path, tools=("Read",),
+                       extra_tools=("mcp__pa__delegate_task",), max_turns=30)
+    args = build_args(cfg)
+    assert args[args.index("--tools") + 1] == "Read"
+    assert "mcp__pa__delegate_task" not in " ".join(a for a in args if a != HARDENED_SETTINGS)
+    assert args[args.index("--max-turns") + 1] == "30"
+    assert "--max-turns" not in build_args(BridgeConfig(workdir=tmp_path, config_dir=tmp_path))
+
+
+def test_abort_from_another_thread_ends_a_pending_send(tmp_path, fake_bin):
+    session = ClaudeSession(make_config(tmp_path, fake_bin))
+    errors = []
+
+    def turn():
+        try:
+            session.send("SLEEP 5")
+        except BridgeError as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=turn)
+    started = time.monotonic()
+    worker.start()
+    for _ in range(200):
+        if session.running:
+            break
+        time.sleep(0.02)
+    time.sleep(0.3)
+    session.abort()
+    session.abort()  # idempotent
+    worker.join(5)
+    assert errors and "exited" in str(errors[0]) and time.monotonic() - started < 4
+    session.close()  # safe after abort
+    with pytest.raises(BridgeError, match="stopped"):
+        session.send("hello")  # an aborted session never starts again
+
+
+def test_abort_and_kill_after_close_never_signal(tmp_path, fake_bin, monkeypatch):
+    session = ClaudeSession(make_config(tmp_path, fake_bin))
+    session.send("hello")
+    session.close()
+    calls = []
+    monkeypatch.setattr("personal_agent.bridge.os.killpg", lambda pid, sig: calls.append((pid, sig)))
+    session.abort()
+    session.kill()
+    assert calls == []
+
+
+def test_close_does_not_signal_a_reaped_process(tmp_path, fake_bin, monkeypatch):
+    session = ClaudeSession(make_config(tmp_path, fake_bin))
+    with pytest.raises(BridgeError):
+        session.send("DIE")
+    calls = []
+    monkeypatch.setattr("personal_agent.bridge.os.killpg", lambda pid, sig: calls.append((pid, sig)))
+    session.close(timeout_s=0)
+    assert calls == []
+
+
+def test_output_outside_a_turn_trips_before_the_next_send(tmp_path, fake_bin):
+    log = tmp_path / "log.jsonl"
+    session = ClaudeSession(make_config(tmp_path, fake_bin), extra_env={"FAKE_CLAUDE_LOG": str(log)})
+    try:
+        assert session.send("STRAY").text == "echo: STRAY"
+        time.sleep(0.6)  # the "peer" turn arrives after the result
+        with pytest.raises(UnexpectedOutput, match="outside a turn"):
+            session.send("next question")
+    finally:
+        session.close()
+
+
+def test_guarded_send_maps_unexpected_output_to_a_safety_stop(tmp_path, fake_bin):
+    from personal_agent.quota import QuotaGuard
+    from personal_agent.router import Router, RouterConfig, SafetyStop, guarded_send
+
+    session = ClaudeSession(make_config(tmp_path, fake_bin))
+    guard = QuotaGuard(0.9, None)
+    try:
+        guarded_send(session, "STRAY", guard)
+        time.sleep(0.6)
+        with pytest.raises(SafetyStop, match="outside a turn"):
+            guarded_send(session, "again", guard)
+    finally:
+        session.close()
+    session = ClaudeSession(make_config(tmp_path, fake_bin))
+    router = Router(session, None, guard, RouterConfig(small_model=None), statuses=lambda: [])
+    assert router.handle("STRAY").text == "echo: STRAY"
+    time.sleep(0.6)
+    reply = router.handle("hello")
+    assert reply.refused and reply.safety and "outside a turn" in reply.text
+    assert router.halted and router.handle("hello").refused
+    router.close()
+
+
+def test_tier2_session_gets_the_hardened_settings(tmp_path):
+    from personal_agent.cli import CHAT_TOOLS  # noqa: F401 - the chat builds tier 2 with tools=()
+
+    args = build_args(BridgeConfig(workdir=tmp_path, config_dir=tmp_path, tools=(), model="haiku"))
+    assert args[args.index("--settings") + 1] == HARDENED_SETTINGS

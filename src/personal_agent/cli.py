@@ -1,4 +1,4 @@
-"""Command line: serve, escalate, status, simulate, chat, vault, plugins, brief."""
+"""Command line: serve, escalate, status, simulate, chat, vault, plugins, brief, hooks."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import shlex
 import shutil
 import site
 import sys
@@ -22,7 +23,7 @@ from . import __version__
 from .config import Config, ConfigError, validate_pin
 from .conversation import Call
 from .escalation import SEVERITIES, Event
-from .status import clean_text, format_status_line, read_statuses
+from .status import clean_text, format_status_line, read_statuses, session_overview
 
 
 def _cmd_serve(config: Config, _args: argparse.Namespace) -> int:
@@ -130,7 +131,14 @@ def _python_paths() -> list[Path]:
     return [Path(p) for p in raw if p]
 
 
-STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json")
+STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json",
+                 "tasks.json", "tasks.lock", "tasks-owner.lock")
+DELEGATION_PROMPT = """
+You can queue background work with the tool mcp__pa__delegate_task (text up to 300 characters,
+optional domain). Use it only when the person asks for background work. The person must approve
+it. You never see the result: tell the person the task id; the result appears in
+outputs/tasks/<id>.md and the person decides what to do with it.
+"""
 
 
 def _workdir_problem(config: Config, workdir: Path, config_dir: Path) -> str | None:
@@ -318,12 +326,14 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
     """Talk to the assistant in the terminal. Writing asks for your approval first."""
     from .approval import PERMISSION_TOOL, ApprovalBroker, ConsoleChannel
     from .approval_server import SERVER_NAME
-    from .bridge import DEFAULT_TURN_TIMEOUT_S, BridgeConfig, BridgeError, ClaudeSession
+    from .bridge import DEFAULT_TURN_TIMEOUT_S, DELEGATE_TOOL, BridgeConfig, BridgeError, ClaudeSession
+    from .console import ChatConsole
+    from .domains import Domains
     from .plugins import invocable, load_for_session
     from .quota import QuotaGuard
     from .remote import RemoteChannel, local_opener
-    from .router import Router, RouterConfig
-    from .vault import VAULT_SYSTEM_PROMPT, Vault, VaultError
+    from .router import Router, RouterConfig, SafetyLatch
+    from .vault import HELPER_SYSTEM_PROMPT, VAULT_SYSTEM_PROMPT, Vault, VaultError
 
     remote = bool(getattr(args, "remote_approvals", False))
     if remote and not config.api_token:
@@ -352,10 +362,13 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
         print(f"[plugins: {', '.join(plugin_names)}]")
 
     console_lock = threading.Lock()
+    console = ChatConsole(console_lock)
     broker = ApprovalBroker(workdir, config.approval_timeout_s)
     broker.allowed_skills = frozenset(allowed_skills)
+
     def stop() -> bool:
-        return broker.closing.is_set() or not broker.turn_active.is_set()
+        # Only the broker's end stops every prompt; each prompt's own scope decides the rest.
+        return broker.closing.is_set()
 
     if remote:
         assert config.api_token
@@ -364,9 +377,11 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
                 response.read(64)
         except (OSError, ValueError):
             print("[warning] `personal-agent serve` is not reachable: remote approvals will be denied")
-        broker.channel = RemoteChannel(_local_url(config, ""), config.api_token, console_lock, stop=stop)
+        broker.channel = RemoteChannel(_local_url(config, ""), config.api_token, console_lock, stop=stop,
+                                       stop_for=broker.request_stopped)
     else:
-        broker.channel = ConsoleChannel(console_lock, stop=stop)
+        broker.channel = ConsoleChannel(console_lock, stop=stop, stop_for=broker.request_stopped, console=console,
+                                        preempted=broker.request_preempted)
     runtime_parent: Path | None = config.state_dir / "run"
     if _inside(runtime_parent.resolve(), root):
         runtime_parent = None
@@ -379,21 +394,46 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
         broker.close()
         print("[error] the approval runtime directory must not be inside the workdir", file=sys.stderr)
         return 2
+    mcp_timeout = {"MCP_TOOL_TIMEOUT": str((config.approval_timeout_s + 30) * 1000)}
+    latch = SafetyLatch()
+    guard = QuotaGuard(config.quota_stop, config.state_dir / "quota.json")
+    domains = Domains(vault)
+    coordinator, notifier, service = _start_tasks(
+        config, args, console, broker, guard, latch, vault, workdir, config_dir, mcp_timeout,
+        HELPER_SYSTEM_PROMPT, PERMISSION_TOOL, SERVER_NAME, domains,
+    )
+    # Delegation is offered (MCP flag, system prompt, init tripwire) only when the task
+    # service really runs: otherwise the person would approve a call that can never run.
+    delegation = service is not None and config.task_delegation
+
+    def close_tasks() -> None:
+        active = service.coordinator if service is not None else coordinator
+        if active is not None:
+            active.close()
+        if notifier is not None:
+            notifier.close()
+
     try:
+        if delegation:
+            broker.on_delegate = service.delegate
+            broker.enable_delegation()  # rewrites mcp.json before the main session starts
         # Outside the vault and 0600. Auto-loading of the vault's CLAUDE.md under
         # --restricted is not verified, so the layout rules travel this way.
-        system_prompt = broker.write_runtime_file("vault-system-prompt.md", VAULT_SYSTEM_PROMPT)
+        system_prompt = broker.write_runtime_file(
+            "vault-system-prompt.md", VAULT_SYSTEM_PROMPT + (DELEGATION_PROMPT if delegation else ""))
     except OSError as exc:
+        close_tasks()
         broker.close()
         print(f"[error] could not write the system prompt: {type(exc).__name__}", file=sys.stderr)
         return 1
 
+    model = args.model or config.claude_model
     main_session = ClaudeSession(
         BridgeConfig(
             workdir=workdir,
             config_dir=config_dir,
             claude_bin=config.claude_bin,
-            model=args.model or config.claude_model,
+            model=model,
             tools=CHAT_TOOLS,
             mcp_config=mcp_path,
             permission_tool=PERMISSION_TOOL,
@@ -403,8 +443,9 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
             expected_mcp=(SERVER_NAME,),
             allowed_skills=allowed_skills,
             oauth_token=config.claude_oauth_token,
+            extra_tools=(DELEGATE_TOOL,) if delegation else (),
         ),
-        extra_env={"MCP_TOOL_TIMEOUT": str((config.approval_timeout_s + 30) * 1000)},
+        extra_env=dict(mcp_timeout),
         turn_timeout_s=max(DEFAULT_TURN_TIMEOUT_S, config.approval_timeout_s + 120),
     )
     # Tier 2: no tools at all, no MCP servers, no permission tool, no plugins. Starts on first use.
@@ -423,18 +464,21 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
     router = Router(
         main_session,
         small_session,
-        QuotaGuard(config.quota_stop, config.state_dir / "quota.json"),
+        guard,
         RouterConfig(config.router_small_model, config.router_small_max_chars),
         statuses=lambda: read_statuses(config.status_dir, config.status_max_age_min),
         vault=vault,
         context_chars=config.vault_context_chars,
         slash_commands=frozenset("/" + name for name in allowed_skills),
         on_context=broker.set_turn_context,
+        latch=latch,
+        tasks=service,
+        domains=domains,
+        # Only this typed tier-1 command may read `claude agents --json` (PA_SESSIONS_SOURCE).
+        sessions=lambda: session_overview(config.status_dir, config.status_max_age_min,
+                                          config.sessions_source, config.claude_bin),
     )
-
-    def say(line: str) -> None:
-        with console_lock:
-            print(line)
+    say = console.say
 
     def on_event(event: dict) -> None:
         broker.observe(event)  # first, and without the console lock: approvals wait for it
@@ -454,10 +498,12 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
     say(f"[vault {workdir} · writing asks first ({where}) · help for commands · /exit to quit]")
     try:
         while True:
-            try:
-                text = input("you> ").strip()
-            except EOFError:
+            if service is not None and service.try_take_over():
+                say("[tasks: this chat now runs the task board]")
+            line = console.read_message("you> ")
+            if line is None:
                 break
+            text = line.strip()
             if text in ("/exit", "/quit"):
                 break
             if not text:
@@ -499,8 +545,132 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
         return 130
     finally:
         # No console lock here: a prompt thread may hold it; closing the broker ends that prompt.
+        # The coordinator closes first, while the broker still runs, so its scopes close cleanly.
+        active = service.coordinator if service is not None else coordinator
+        if active is not None:
+            active.close()
         router.close()
         broker.close()
+        if notifier is not None:
+            notifier.close()
+        console.flush()
+    return 0
+
+
+def _start_tasks(config: Config, args: argparse.Namespace, console: object, broker: object, guard: object,
+                 latch: object, vault: object, workdir: Path, config_dir: Path, mcp_timeout: dict[str, str],
+                 helper_prompt_text: str, permission_tool: str, server_name: str,
+                 domains: object = None) -> tuple:
+    """The task board and, if this chat owns it, the coordinator. (coordinator, notifier, service)."""
+    from .bridge import ClaudeSession
+    from .coordinator import (
+        Coordinator,
+        TaskNotifier,
+        TaskService,
+        helper_bridge_config,
+        helper_turn_timeout,
+        notice_line,
+    )
+    from .remote import DiscordWebhook
+    from .tasks import TaskBoard, TaskError
+
+    if not config.tasks_enabled:
+        return None, None, None
+    try:
+        helper_prompt = broker.write_runtime_file("helper-system-prompt.md", helper_prompt_text)  # type: ignore[attr-defined]
+    except OSError as exc:
+        console.say(f"[warning] tasks are off: could not write the helper prompt ({type(exc).__name__})")  # type: ignore[attr-defined]
+        return None, None, None
+    board = TaskBoard(config.state_dir)
+    notifier = None
+    if config.task_discord == "counts":
+        if config.discord_webhook:
+            notifier = TaskNotifier(DiscordWebhook(config.discord_webhook), board)
+        else:
+            console.say("[warning] PA_TASK_DISCORD=counts needs PA_DISCORD_WEBHOOK; task notices stay in the chat")  # type: ignore[attr-defined]
+
+    def notify(event: object) -> None:
+        console.notice(notice_line(event))  # type: ignore[arg-type, attr-defined]
+        if notifier is not None:
+            notifier.record(event)  # type: ignore[arg-type]
+
+    model = config.task_model or args.model or config.claude_model
+
+    def make_session(task: object, scope: object) -> ClaudeSession:
+        cfg = helper_bridge_config(
+            task, scope,  # type: ignore[arg-type]
+            workdir=workdir, config_dir=config_dir, claude_bin=config.claude_bin, model=model,
+            system_prompt_file=helper_prompt, permission_tool=permission_tool, server_name=server_name,
+            oauth_token=config.claude_oauth_token,
+        )
+        return ClaudeSession(cfg, extra_env=dict(mcp_timeout),
+                             turn_timeout_s=helper_turn_timeout(config.approval_timeout_s))
+
+    coordinator = Coordinator(
+        board, broker, guard, latch, vault, make_session, notify,  # type: ignore[arg-type]
+        max_parallel=config.task_parallel, task_timeout_s=config.task_timeout_s,
+        task_quota_stop=config.task_quota_stop, max_age_s=config.task_max_age_h * 3600,
+        domains=domains, domain_context_chars=config.domain_context_chars,  # type: ignore[arg-type]
+    )
+    try:
+        aside = board.repair()
+        if aside:
+            console.say(f"[tasks: the task board was unreadable and was set aside as {aside}]")  # type: ignore[attr-defined]
+        owner = coordinator.start()
+    except TaskError as exc:
+        console.say(f"[warning] tasks are off: {exc}")  # type: ignore[attr-defined]
+        if notifier is not None:
+            notifier.close()
+        return None, None, None
+    if owner:
+        queued = sum(1 for t in board.load()[0] if t.status in ("queued", "waiting"))
+        if queued:
+            console.say(f"[tasks: {queued} queued]")  # type: ignore[attr-defined]
+    else:
+        console.say("[tasks: another chat owns the task board; tasks you add here run there]")  # type: ignore[attr-defined]
+    # A chat that is not the owner keeps the coordinator on standby: when the owner chat
+    # exits, this one takes over (TaskService.try_take_over) instead of leaving tasks queued.
+    service = TaskService(board, coordinator if owner else None, latch, vault, domains,  # type: ignore[arg-type]
+                          standby=None if owner else coordinator)
+    return (coordinator if owner else None), notifier, service
+
+
+HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "Notification", "Stop", "StopFailure", "SessionEnd")
+
+
+def _hook_default_status_dir() -> Path:
+    """Where the status hook writes without PA_STATUS_DIR (same rule as in the hook)."""
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "personal-agent" / "sessions"
+
+
+def hook_snippet(config: Config) -> dict:
+    """The value of the "hooks" key of a Claude Code settings file for the status hook."""
+    if not os.path.isabs(sys.executable or ""):
+        raise ValueError("the Python interpreter path is not absolute")
+    hook = Path(personal_agent.__file__).resolve().parent / "claude_status_hook.py"
+    if not hook.is_file():
+        raise ValueError("the packaged status hook is missing")
+    command = shlex.join([sys.executable, "-I", "-S", str(hook)])
+    status_dir = Path(os.path.abspath(config.status_dir.expanduser()))
+    if status_dir != Path(os.path.abspath(_hook_default_status_dir().expanduser())):
+        command = f"PA_STATUS_DIR={shlex.quote(str(status_dir))} {command}"
+    return {event: [{"hooks": [{"type": "command", "command": command}]}] for event in HOOK_EVENTS}
+
+
+def _cmd_hooks(config: Config, args: argparse.Namespace) -> int:
+    """Print the settings snippet for the status hook. Never opens, reads or writes a settings file."""
+    if args.hooks_command != "snippet":  # argparse allows only "snippet"
+        return 2
+    try:
+        snippet = hook_snippet(config)
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(snippet, indent=2))
+    print('Add this to the "hooks" section of your Claude Code settings (for example ~/.claude/settings.json).',
+          file=sys.stderr)
+    print("This command never edits any settings file.", file=sys.stderr)
     return 0
 
 
@@ -553,6 +723,10 @@ def build_parser() -> argparse.ArgumentParser:
     brief.add_argument("--polish", action="store_true",
                        help="let the small model rewrite the text once per day (respects the quota guard)")
     brief.add_argument("--quiet", action="store_true", help="do not print the brief")
+
+    hooks = sub.add_parser("hooks", help="the status hook for your Claude Code sessions")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
+    hooks_sub.add_parser("snippet", help="print the settings.json snippet (never edits any settings file)")
     return parser
 
 
@@ -565,6 +739,7 @@ COMMANDS = {
     "vault": _cmd_vault,
     "plugins": _cmd_plugins,
     "brief": _cmd_brief,
+    "hooks": _cmd_hooks,
 }
 
 

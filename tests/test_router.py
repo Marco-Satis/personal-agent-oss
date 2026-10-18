@@ -16,6 +16,9 @@ from personal_agent.status import SessionStatus
 
 FAKE = Path(__file__).resolve().parent / "fake_claude.py"
 NOW = 1_800_000_000.0
+TASK_ENV_NAMES = ("PA_TASKS", "PA_TASK_PARALLEL", "PA_TASK_MODEL", "PA_TASK_TIMEOUT_S", "PA_TASK_QUOTA_STOP",
+                  "PA_TASK_DISCORD", "PA_TASK_DELEGATION", "PA_TASK_MAX_AGE_H", "PA_DOMAIN_CONTEXT_CHARS",
+                  "PA_SESSIONS_SOURCE")
 
 
 class Clock:
@@ -385,7 +388,7 @@ def chat(tmp_path, monkeypatch):
     monkeypatch.setenv("PA_STATE_DIR", str(state))
     monkeypatch.setenv("PA_CLAUDE_BIN", str(wrapper))
     for name in ("PA_WORKDIR", "PA_CLAUDE_CONFIG_DIR", "PA_STATUS_DIR", "PA_QUOTA_STOP",
-                 "PA_ROUTER_SMALL_MODEL", "PA_ROUTER_SMALL_MAX_CHARS", "PA_CLAUDE_MODEL"):
+                 "PA_ROUTER_SMALL_MODEL", "PA_ROUTER_SMALL_MAX_CHARS", "PA_CLAUDE_MODEL", *TASK_ENV_NAMES):
         monkeypatch.delenv(name, raising=False)
 
     def run(lines):
@@ -419,6 +422,47 @@ def test_chat_tier1_starts_no_process(chat, capsys):
     assert "agent[1]> waiting" in out and "demo-project" in out
     assert "agent[1]> Commands answered without a model" in out
     assert "agent[1]> no quota data yet" in out
+    assert not chat.log.exists()
+
+
+def test_chat_sessions_reads_only_the_hook_files_by_default(chat, capsys):
+    sessions = chat.state / "sessions"
+    sessions.mkdir(parents=True)
+    now = time.time()
+    for sid, state in (("a", "idle"), ("b", "waiting")):
+        (sessions / f"{sid}.json").write_text(json.dumps(
+            {"session_id": sid, "project": f"proj-{sid}", "state": state, "summary": "",
+             "updated_at": now, "since": now - 300}))
+    assert chat.run(["sessions", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "agent[1]> 2 sessions (1 waiting)" in out
+    assert out.index("proj-b") < out.index("proj-a")  # waiting first
+    assert not chat.log.exists()  # neither a model nor `claude agents` was started
+
+
+def test_chat_sessions_with_the_agents_source(chat, capsys, monkeypatch):
+    listing = [{"cwd": "/home/person/secret/proj-z", "kind": "background", "id": "bg-1", "state": "blocked"}]
+    chat.make_wrapper(f"FAKE_CLAUDE_AGENTS_JSON={shlex.quote(json.dumps(listing))} ")
+    monkeypatch.setenv("PA_SESSIONS_SOURCE", "both")
+    assert chat.run(["sessions", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "agent[1]> 1 sessions (1 waiting)" in out and "proj-z" in out and "background" in out
+    assert "/home/person" not in out
+    [start] = chat.starts()
+    assert start["args"] == ["agents", "--json"]
+    assert not {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "PA_API_TOKEN"} & set(start["env"])
+
+
+def test_chat_domain_commands_start_no_process(chat, capsys):
+    folder = chat.state / "vault" / "wiki" / "domains"
+    folder.mkdir(parents=True, mode=0o700)
+    chat.state.chmod(0o700)
+    (folder / "research.md").write_text("# Domain: research\n\nLinks: finance\n\n## Notes\n- a finding\n")
+    assert chat.run(["domains", "domain research", "domain nope", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "agent[1]> research             1 links  1 notes" in out
+    assert "agent[1]> domain research · wiki/domains/research.md" in out and "- a finding" in out
+    assert "agent[1]> no domain nope" in out
     assert not chat.log.exists()
 
 
@@ -852,7 +896,7 @@ def test_chat_loads_enabled_plugin(plugin_chat, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "[plugins: demo]" in out
     assert "agent[3]> echo: /demo:hello" in out
-    assert "agent[3]> skill demo:hello loaded" in out and "[approval]" not in out
+    assert "agent[3]> skill demo:hello loaded" in out and "[approval" not in out
     args = plugin_chat.starts()[0]["args"]
     assert args[args.index("--plugin-dir") + 1] == str(plugin_chat.state / "plugins" / "demo")
     assert "Skill" in args[args.index("--tools") + 1].split(",")
@@ -892,7 +936,7 @@ def test_chat_loads_the_shipped_core_plugin(chat, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "[plugins: core]" in out and "core plugin not found" not in out
     assert "agent[3]> echo: /core:daily-plan" in out  # verbatim, so the CLI expands the skill
-    assert "agent[3]> skill core:organize-inbox loaded" in out and "[approval]" not in out
+    assert "agent[3]> skill core:organize-inbox loaded" in out and "[approval" not in out
     assert "unknown command" in out and "[safety]" not in out
     starts = chat.starts()
     assert len(starts) == 1
@@ -914,3 +958,129 @@ def test_chat_slash_bypass_is_refused_without_a_process(plugin_chat, capsys):
     out = capsys.readouterr().out
     assert out.count("unknown command") == 3
     assert plugin_chat.starts() == []
+
+
+# --- phase 3: task commands, the shared latch, quota thresholds for helpers ---------------
+
+from personal_agent.router import SafetyLatch  # noqa: E402
+
+
+class FakeTasks:
+    def __init__(self):
+        self.commands = []
+
+    def command(self, command):
+        self.commands.append(command)
+        return f"handled {command.kind} {command.arg}", False
+
+
+@pytest.mark.parametrize("text, kind", [
+    ("task summarise the backups", "task_add"),
+    ("tasks", "tasks"),
+    ("task show 3f2a", "task_show"),
+    ("task cancel 3f2a9c", "task_cancel"),
+])
+def test_task_commands_are_tier1_without_quota_or_session(text, kind):
+    main, small = StubSession("main"), StubSession("small")
+    tasks = FakeTasks()
+    router = Router(main, small, guard_with(info(five=0.99, five_reset=NOW + 3600)), CFG, statuses=lambda: [],
+                    tasks=tasks)
+    router.halted = "a hook ran"  # task commands still work while halted
+    reply = router.handle(text)
+    assert reply.tier == 1 and not reply.refused and reply.text.startswith(f"handled {kind}")
+    assert main.sent == [] and small.sent == []
+
+
+def test_task_commands_when_tasks_are_off():
+    router = make_router()
+    reply = router.handle("task do something")
+    assert reply.tier == 1 and reply.is_error and reply.text == "tasks are off (PA_TASKS=off)"
+    assert router.handle("task").text.startswith("usage: task")
+
+
+def test_force_prefix_sends_task_text_to_the_assistant():
+    main = StubSession("main")
+    tasks = FakeTasks()
+    router = Router(main, None, guard_with(None), CFG, statuses=lambda: [], tasks=tasks)
+    reply = router.handle("!task summarise this")
+    assert reply.tier == 3 and main.sent == ["task summarise this"] and tasks.commands == []
+
+
+def test_help_mentions_tasks_only_when_enabled():
+    assert "task [@domain] <text>" not in make_router().handle("help").text
+    router = Router(StubSession("main"), None, guard_with(None), CFG, statuses=lambda: [], tasks=FakeTasks())
+    assert "task [@domain] <text>" in router.handle("help").text
+
+
+def test_safety_latch_is_shared_and_first_reason_wins():
+    latch = SafetyLatch()
+    seen = []
+    latch.add_listener(seen.append)
+    router = Router(StubSession("main"), None, guard_with(None), CFG, statuses=lambda: [], latch=latch)
+    assert router.halted is None and not latch
+    latch.trip("helper: a hook ran\x07 inside")
+    latch.trip("second reason")
+    assert router.halted == "helper: a hook ran inside" and seen == ["helper: a hook ran inside"]
+    assert router.handle("hello").refused
+    late = []
+    latch.add_listener(late.append)  # a late listener hears about an earlier trip
+    assert late == ["helper: a hook ran inside"]
+
+
+def test_quota_check_with_a_lower_threshold_and_freshness():
+    clock = Clock()
+    guard = guard_with(info(five=0.6, five_reset=NOW + 3600), clock=clock)
+    assert not guard.check(stop_at=0.5).ok and "stop at 50 %" in guard.check(stop_at=0.5).reason
+    assert guard.check().ok  # 0.9 for the chat
+    assert guard.check(require_fresh_s=900).fresh
+    clock.now += 901
+    assert not guard.check(require_fresh_s=900).fresh and guard.check().fresh
+    assert not guard_with(None).check(require_fresh_s=900).fresh
+
+
+def test_chat_runs_a_task_and_shows_the_notice(chat, capsys):
+    import json as _json
+
+    state = chat.state
+    done = {"id": None}
+
+    def lines():
+        yield "task hello from a helper"
+        for _ in range(500):
+            path = state / "tasks.json"
+            if path.exists():
+                tasks = _json.loads(path.read_text())["tasks"]
+                if tasks and tasks[0]["status"] == "done":
+                    done["id"] = tasks[0]["id"]
+                    break
+            time.sleep(0.02)
+        yield "tasks"
+        yield "/exit"
+
+    from personal_agent.cli import main
+
+    it = lines()
+    import builtins
+
+    original = builtins.input
+    builtins.input = lambda prompt="": next(it)
+    try:
+        assert main(["chat"]) == 0
+    finally:
+        builtins.input = original
+    out = capsys.readouterr().out
+    task_id = done["id"]
+    assert task_id, out
+    assert f"agent[1]> task {task_id} queued (0 running, 0 ahead) · result: outputs/tasks/{task_id}.md" in out
+    assert f"[task {task_id} done: outputs/tasks/{task_id}.md]" in out
+    assert (state / "vault" / "outputs" / "tasks" / f"{task_id}.md").exists()
+    assert f"{task_id}  done" in out
+    helper_start = [s for s in chat.starts() if "--no-session-persistence" in s["args"]]
+    assert len(helper_start) == 1
+
+
+def test_chat_with_tasks_off(chat, capsys, monkeypatch):
+    monkeypatch.setenv("PA_TASKS", "off")
+    assert chat.run(["task x", "/exit"]) == 0
+    assert "agent[1]> tasks are off (PA_TASKS=off)" in capsys.readouterr().out
+    assert not (chat.state / "tasks.json").exists()

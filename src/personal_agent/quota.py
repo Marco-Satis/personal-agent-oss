@@ -48,6 +48,7 @@ RESET_COMMAND = "quota reset"     # chat command that clears the saved quota dat
 class QuotaCheck:
     ok: bool
     reason: str
+    fresh: bool = True  # False: no data, or older than check(require_fresh_s=...) allows
 
 
 def _number(value: object) -> float | None:
@@ -202,8 +203,8 @@ class QuotaGuard:
 
     # --- decisions --------------------------------------------------------------
 
-    def _conditions(self, data: dict, now: float) -> list[str]:
-        """Reasons that block right now."""
+    def _conditions(self, data: dict, now: float, stop_at: float) -> list[str]:
+        """Reasons that block right now, with stop_at as the window threshold."""
         probe_until = data["observed_at"] + PROBE_AFTER_S
         found = []
 
@@ -232,26 +233,37 @@ class QuotaGuard:
                 found.append(f"quota status is '{shown}' ({when(top_reset, until)})")
         for name in WINDOWS:
             window = data.get("windows", {}).get(name)
-            if not window or window.get("utilization") is None or window["utilization"] < self.stop_at:
+            if not window or window.get("utilization") is None or window["utilization"] < stop_at:
                 continue
             until = blocking(window.get("resetsAt"))
             if until is not None:
                 found.append(
                     f"{WINDOW_LABELS[name]} at {_percent(window['utilization'])}, stop at "
-                    f"{_percent(self.stop_at)} ({when(window.get('resetsAt'), until)})"
+                    f"{_percent(stop_at)} ({when(window.get('resetsAt'), until)})"
                 )
         return found
 
-    def check(self) -> QuotaCheck:
+    def check(self, stop_at: float | None = None, require_fresh_s: float | None = None) -> QuotaCheck:
+        """Whether a turn may start. stop_at None means self.stop_at.
+
+        Background helpers pass a lower stop_at, so they leave headroom for the chat.
+        With require_fresh_s, `fresh` is False when there is no data or it is older;
+        the caller then runs at most one probe turn at a time.
+        """
+        threshold = self.stop_at if stop_at is None else stop_at
         with self._lock:
+            now = self.clock()
+            fresh = True
+            if require_fresh_s is not None:
+                fresh = bool(self._data) and now - self._data["observed_at"] <= require_fresh_s
             if self._paid_reason:
-                return QuotaCheck(False, self._paid_reason)
+                return QuotaCheck(False, self._paid_reason, fresh)
             if not self._data:
-                return QuotaCheck(True, "no quota data yet")
-            found = self._conditions(self._data, self.clock())
+                return QuotaCheck(True, "no quota data yet", fresh)
+            found = self._conditions(self._data, now, threshold)
         if found:
-            return QuotaCheck(False, "; ".join(found))
-        return QuotaCheck(True, "within quota")
+            return QuotaCheck(False, "; ".join(found), fresh)
+        return QuotaCheck(True, "within quota", fresh)
 
     def describe(self) -> str:
         """One line for the `quota` command."""

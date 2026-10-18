@@ -25,10 +25,14 @@ import threading
 PROTOCOL = 1
 SERVER_NAME = "pa"
 TOOL_NAME = "approve"
+DELEGATE_TOOL_NAME = "delegate_task"   # offered only with PA_APPROVAL_DELEGATE=1 (main session)
 ENV_SOCKET = "PA_APPROVAL_SOCKET"
 ENV_TOKEN = "PA_APPROVAL_TOKEN"
 ENV_TIMEOUT = "PA_APPROVAL_TIMEOUT_S"
+ENV_DELEGATE = "PA_APPROVAL_DELEGATE"
 ENV_PREFIX = "PA_APPROVAL_"
+MAX_DELEGATE_TEXT = 300
+TASK_ID_CHARS = frozenset("0123456789abcdef")
 MAX_FRAME_BYTES = 256 * 1024
 MAX_REPLY_BYTES = 16 * 1024
 MAX_STR_CHARS = 2000      # strings forwarded to the broker are cut to this length
@@ -53,6 +57,24 @@ TOOL_SCHEMA = {
         "required": ["tool_name", "input"],
     },
 }
+
+DELEGATE_SCHEMA = {
+    "name": DELEGATE_TOOL_NAME,
+    "description": (
+        "Queue a background task for a helper. The person must approve it. Returns only a task id; "
+        "the result is saved to outputs/tasks/<id>.md later and is never returned to you."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "text": {"type": "string", "maxLength": MAX_DELEGATE_TEXT},
+            "domain": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 32},
+        },
+        "required": ["text"],
+    },
+}
+DELEGATE_NOTE = "The person is notified when it finishes. Do not wait for it."
 
 
 def deny(message: str) -> dict:
@@ -128,9 +150,22 @@ def ask_broker(
         "tool_use_id": tool_use_id if isinstance(tool_use_id, str) else None,
         "input_sha256": input_digest(tool_input),
     }
+    if len(json.dumps(frame, ensure_ascii=True)) + 1 > MAX_FRAME_BYTES:
+        return deny("request too large to review")
+    answer = _exchange(socket_path, frame, timeout_s)
+    if answer is None:
+        return deny("approval service unreachable")
+    if answer.get("allow") is True:
+        return allow(tool_input)
+    message = answer.get("message")
+    return deny(message if isinstance(message, str) and message else "not approved")
+
+
+def _exchange(socket_path: str, frame: dict, timeout_s: float) -> dict | None:
+    """Send one frame to the broker and return its reply, or None on any failure."""
     data = (json.dumps(frame, ensure_ascii=True) + "\n").encode("ascii")
     if len(data) > MAX_FRAME_BYTES:
-        return deny("request too large to review")
+        return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(CONNECT_TIMEOUT_S)
@@ -139,13 +174,40 @@ def ask_broker(
             sock.sendall(data)
             answer = json.loads(_read_line(sock, MAX_REPLY_BYTES))
     except (OSError, ValueError):
-        return deny("approval service unreachable")
+        return None
     if not isinstance(answer, dict) or answer.get("v") != PROTOCOL:
-        return deny("approval service unreachable")
-    if answer.get("allow") is True:
-        return allow(tool_input)
+        return None
+    return answer
+
+
+def _tool_text(payload: object, is_error: bool = False) -> dict:
+    result = {"content": [{"type": "text", "text": json.dumps(payload) if not isinstance(payload, str) else payload}]}
+    if is_error:
+        result["isError"] = True
+    return result
+
+
+def ask_broker_delegate(socket_path: str, token: str, arguments: object, timeout_s: float) -> dict:
+    """Run one approved delegation: the broker queues the task and returns only its id."""
+    if not isinstance(arguments, dict) or not socket_path or not token:
+        return _tool_text("delegation refused: invalid request", is_error=True)
+    frame = {
+        "v": PROTOCOL,
+        "op": "delegate",
+        "token": token,
+        "input": shrink_input(arguments),
+        "input_sha256": input_digest(arguments),
+    }
+    answer = _exchange(socket_path, frame, timeout_s)
+    if answer is None:
+        return _tool_text("delegation refused: approval service unreachable", is_error=True)
+    task_id = answer.get("task_id")
+    if (answer.get("allow") is True and isinstance(task_id, str) and len(task_id) == 6
+            and set(task_id) <= TASK_ID_CHARS):
+        return _tool_text({"task_id": task_id, "status": "queued", "note": DELEGATE_NOTE})
     message = answer.get("message")
-    return deny(message if isinstance(message, str) and message else "not approved")
+    message = message[:300] if isinstance(message, str) and message else "not approved"
+    return _tool_text(f"delegation refused: {message}", is_error=True)
 
 
 def _timeout(env: dict) -> float:
@@ -195,11 +257,20 @@ def handle(msg: dict, env: dict) -> dict | None:
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": [TOOL_SCHEMA]}
+        delegate = env.get(ENV_DELEGATE) == "1"
+        result = {"tools": [TOOL_SCHEMA, DELEGATE_SCHEMA] if delegate else [TOOL_SCHEMA]}
     elif method == "tools/call":
-        if params.get("name") != TOOL_NAME:
+        name = params.get("name")
+        if name == DELEGATE_TOOL_NAME and env.get(ENV_DELEGATE) == "1":
+            try:
+                result = ask_broker_delegate(env.get(ENV_SOCKET) or "", env.get(ENV_TOKEN) or "",
+                                             params.get("arguments"), _timeout(env))
+            except Exception:  # noqa: BLE001 - any failure is a refusal
+                result = _tool_text("delegation refused: approval service failed", is_error=True)
+        elif name != TOOL_NAME:
             return _error(msg_id, -32602, "unknown tool")
-        result = _call_tool(params, env)
+        else:
+            result = _call_tool(params, env)
     else:
         return _error(msg_id, -32601, "method not found")
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -213,7 +284,7 @@ def scrub_environ(environ) -> None:
 
 
 def main() -> int:
-    env = {key: os.environ.get(key, "") for key in (ENV_SOCKET, ENV_TOKEN, ENV_TIMEOUT)}
+    env = {key: os.environ.get(key, "") for key in (ENV_SOCKET, ENV_TOKEN, ENV_TIMEOUT, ENV_DELEGATE)}
     scrub_environ(os.environ)
     if not env[ENV_SOCKET] or not env[ENV_TOKEN]:
         print("approval server: socket or token missing, every request is denied", file=sys.stderr)

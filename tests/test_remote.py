@@ -600,7 +600,7 @@ def test_remote_channel_approved_from_the_page(served, monkeypatch):
     thread.join(15)
     assert result["value"] is True
     text = "\n".join(out)
-    assert "approval pending remotely: Write (level 2)" in text and "[approved remotely]" in text
+    assert "approval pending remotely · chat: Write (level 2)" in text and "[approved remotely]" in text
     assert TOKEN not in text and link_id(served.notifier.posts[-1]) not in text
 
 
@@ -858,7 +858,7 @@ def test_chat_with_remote_approval(remote_chat, served, capsys):
     clicker.join(10)
     out = capsys.readouterr().out
     assert (remote_chat.state / "vault" / "a.txt").read_text() == "x"
-    assert "[approval pending remotely: Write (level 2), link sent]" in out
+    assert "[approval pending remotely · chat: Write (level 2), link sent]" in out
     assert "agent[3]> wrote a.txt" in out
     assert TOKEN not in out
 

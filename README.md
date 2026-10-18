@@ -74,10 +74,13 @@ personal-agent chat
 The assistant may read, search, write and edit files in its [vault](#the-vault). **Writing asks you first:**
 
 ```
-[approval] level 2 (write): Write
+[approval · chat] level 2 (write): Write
   file_path="notes/a.md", content=11 chars: "hello world"
 Allow? [y/N]
 ```
+
+The part after `approval ·` says who asks: `chat` for the main assistant, `task 3f2a9c (research)` for a
+[background helper](#background-tasks).
 
 - **Level 1 (read)**: reading inside the vault, allowed without asking.
 - **Level 2 (write)**: answer `y` to allow; anything else denies.
@@ -90,8 +93,9 @@ No answer within `PA_APPROVAL_TIMEOUT_S`, a closed terminal or any internal erro
 
 Every reply shows which tier answered it:
 
-- `agent[1]>`: `help`, `status` (your Claude Code sessions), `quota`, `quota reset` and
-  `note <text>` are answered without any model.
+- `agent[1]>`: `help`, `status` and `sessions` (your [Claude Code sessions](#connect-your-claude-code-sessions)),
+  `quota`, `quota reset`, `note <text>`, the task commands (`task <text>`, `tasks`, `task show <id>`,
+  `task cancel <id>`) and `domains` / `domain <name>` are answered without any model.
 - `agent[2]>`: short, self-contained questions ("What is the capital of France?") go to a small model
   in a separate session **with no tools**.
 - `agent[3]>`: everything else goes to the main assistant. Start a message with `!` to force this tier.
@@ -122,6 +126,87 @@ source checkout the core plugin was found in (the default `$PA_STATE_DIR/vault` 
 | `PA_QUOTA_STOP` | `0.9` | stop sending at this share of a usage window (greater than 0, at most 1) |
 | `PA_ROUTER_SMALL_MODEL` | `haiku` | model alias for tier 2; `off` sends everything to the main assistant |
 | `PA_ROUTER_SMALL_MAX_CHARS` | `160` | longest message tier 2 may take (20–2000) |
+| `PA_TASKS` | `on` | background tasks in the chat (`on`/`off`) |
+| `PA_TASK_PARALLEL` | `2` | helpers running at once (1–2) |
+| `PA_TASK_MODEL` | the chat's model | model alias for helpers |
+| `PA_TASK_TIMEOUT_S` | `900` | a helper running longer is stopped (60–3600) |
+| `PA_TASK_QUOTA_STOP` | `min(0.8, PA_QUOTA_STOP)` | helpers stop starting at this share of a usage window, leaving headroom for the chat |
+| `PA_TASK_MAX_AGE_H` | `24` | queued tasks older than this expire instead of starting (1–720) |
+| `PA_TASK_DISCORD` | `off` | `counts`: post task counts (never content) to `PA_DISCORD_WEBHOOK` |
+| `PA_TASK_DELEGATION` | `off` | `on`: the main assistant may queue tasks itself, each with your approval |
+| `PA_DOMAIN_CONTEXT_CHARS` | `4000` | character budget for domain notes attached to a helper's message (0–8000, `0` attaches none) |
+| `PA_SESSIONS_SOURCE` | `hooks` | where `sessions` looks: `hooks` (status files), `agents` (`claude agents --json`) or `both`; see [below](#connect-your-claude-code-sessions) |
+
+### Background tasks
+
+Hand work to the assistant and keep chatting:
+
+```
+you> task @research summarise the backup options in wiki/
+agent[1]> task 3f2a9c queued (0 running, 0 ahead) · result: outputs/tasks/3f2a9c.md
+...
+[task 3f2a9c done: outputs/tasks/3f2a9c.md]
+```
+
+| Command | What it does |
+|---|---|
+| `task [@domain] <text>` | queue a task (also `aufgabe`); `task add <text>` works too |
+| `tasks` | open tasks, then the five newest finished ones |
+| `task show <id>` | details and a preview of the result (marked as data written by a helper) |
+| `task cancel <id>` | a queued task is cancelled at once, a running helper is stopped |
+
+- Each task runs in a separate **helper**: a one-shot, locked-down Claude Code session in the vault with
+  the same hardening as the chat, its own approval scope and no transcript. It can read the vault; with
+  a `@domain` it may also append up to three lines `- YYYY-MM-DD (task <id>): finding` under `## Notes`
+  in `wiki/domains/<domain>.md` (only at the end of the file, never inside the `Links:` line or an
+  earlier note), and only after you approve. Every other write is denied without asking.
+  Helpers have no Skill, Task or Agent tool and cannot start other helpers.
+- At most two helpers run at once; the rest wait (`queued`, or `waiting` with the reason, e.g. the
+  quota). Tasks run only while a chat is open, because approvals need you; a second open chat can add,
+  list and cancel, but the tasks run (and ask) in the first one. When the first chat closes, the second
+  one takes over and says so.
+- The helper's final answer becomes `outputs/tasks/<id>.md`, written by the agent itself. The result is
+  never fed back to the main assistant; you decide what to do with it. The main assistant may not write
+  task results, and a turn in which it read them marks its approval prompts like note context.
+- Limits: `PA_TASK_TIMEOUT_S` per task, at most 30 model turns per helper, at most 3 approval prompts per
+  task (a helper prompt waits at most 2 minutes and steps aside when the chat needs the terminal), 20 open
+  tasks, 30 task starts per day. Without fresh quota data only one helper runs, as a probe.
+- A safety stop in any session (hook event, unexpected tool or plugin, output outside a turn) stops the
+  chat **and** every helper until you restart.
+- While you are idle at `you>`, a helper's approval prompt takes over the terminal; anything you were
+  typing is discarded, and the prompt says so. In this mode the terminal has no line history.
+- With `PA_TASK_DELEGATION=on` the main assistant gets a tool to queue a task (up to 300 characters). Each
+  delegation needs your approval (level 3 with `confirm` when the turn carries note or skill context),
+  at most one per turn; the assistant only gets the task id back, never the result. Delegated tasks are
+  marked `[delegated]`.
+
+### Domains
+
+A domain is a memory file per topic for background tasks: `wiki/domains/<domain>.md`. The first
+`task @<domain> …` creates it (names: lowercase letters, digits and dashes, at most 32 characters; at most
+50 domains):
+
+```markdown
+# Domain: research
+
+Links: finance, home-network
+
+## Notes
+- 2026-10-18 (task 3f2a9c): restic supports append-only repositories
+```
+
+| Command | What it does |
+|---|---|
+| `domains` | one line per domain: links, number of notes, last change (also `bereiche`) |
+| `domain <name>` | the links and the newest 20 note lines (also `domain show <name>`, `bereich <name>`) |
+
+- A helper for a `@domain` task gets the domain's notes, then the notes of the domains on its `Links:`
+  line, in front of its message: inside a `<domain-notes>` block with a random id, escaped and labelled as
+  reference data, never instructions. Own notes first (up to 60 % of `PA_DOMAIN_CONTEXT_CHARS` when linked
+  notes come too), the newest lines kept. Links go one level deep (a linked domain's links are not
+  followed) and at most five count; only you edit them.
+- Helpers add notes only through the approved append described above. Domain notes are never attached to
+  chat messages or the morning brief. Symlinked or oversized (over 128 KiB) domain files are not attached.
 
 ### The vault
 
@@ -133,7 +218,9 @@ CLAUDE.md               structure rules, so the vault does not sprawl
 heute.md                today's focus: Top 3 and notes
 raw/                    captured, unprocessed notes: raw/inbox-YYYY-MM-DD.md
 wiki/                   organized articles, one topic per file, listed in wiki/_master-index.md
-outputs/                generated results such as briefs
+outputs/                generated results such as briefs; outputs/tasks/<id>.md are task results
+wiki/domains/           domain notes for tasks, created on first `task @<domain>`; never attached to
+                        chat messages or the brief
 ```
 
 `personal-agent vault path` prints where it is. **Moved:** earlier versions used
@@ -281,19 +368,50 @@ when the quota or session status changed in between.
 
 ## Connect your Claude Code sessions
 
-Add the status hook to `~/.claude/settings.json` (adjust the path):
+Your sessions report their state through a small hook (standard library only) that writes one status
+file per session. Print the settings snippet for it:
+
+```bash
+personal-agent hooks snippet
+```
+
+It prints the value for the `"hooks"` section of your Claude Code settings (for example
+`~/.claude/settings.json`) with the absolute paths of your interpreter and the packaged hook, and
+`PA_STATUS_DIR=...` in front when your status directory is not the default. Merge it by hand: the
+command **never opens, reads or edits any settings file**. Example output (shortened):
 
 ```json
 {
-  "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 /path/to/hooks/claude_status_hook.py" }] }],
-    "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "python3 /path/to/hooks/claude_status_hook.py" }] }],
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "python3 /path/to/hooks/claude_status_hook.py" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 /path/to/hooks/claude_status_hook.py" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 /path/to/hooks/claude_status_hook.py" }] }]
-  }
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/usr/bin/python3 -I -S /.../personal_agent/claude_status_hook.py" }] }],
+  "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "..." }] }],
+  "Notification":     [{ "hooks": [{ "type": "command", "command": "..." }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "..." }] }],
+  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "..." }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "..." }] }]
 }
 ```
+
+In the chat, `sessions` (also `sitzungen`) lists them without a model, waiting ones first:
+
+```
+you> sessions
+agent[1]> 3 sessions (1 waiting)
+waiting     4 min  shop-backend                     Claude needs your permission to use Bash
+working    12 min  docs-site
+idle       40 min  personal-agent
+```
+
+- Only the project folder's name is shown, never the full path, and all text is cleaned. `status`
+  keeps its older output (errors first), which the phone call uses too.
+- `PA_SESSIONS_SOURCE=agents` or `both` also asks Claude Code itself through the documented
+  `claude agents --json` (merged by session id; Claude Code's state wins). It is **off by default**:
+  agent view is a research preview, the listing covers every project, and the docs do not say whether
+  the call starts the agent-view supervisor. It runs only for the typed `sessions` command, with a
+  minimal environment (no API keys, never the assistant's own config dir), a 5 s timeout and a 10 s
+  cache; nothing from it is logged or sent to Discord or the phone.
+- The agent **never sends anything into your sessions**: Claude Code documents no stable way for a
+  separate process to do that. To answer a waiting session, attach in a terminal, use agent view or
+  Remote Control. Background in [docs/SESSION-CONTROL.md](docs/SESSION-CONTROL.md).
 
 Set `PA_WAITING_ESCALATE_MIN=20` to get a call when a session has waited 20 minutes for you.
 

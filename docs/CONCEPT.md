@@ -17,8 +17,9 @@ Normal notifications stay in whatever chat channel you already use. The phone ri
 
 - **Small and auditable.** v1 has zero runtime dependencies (Python standard library only).
   Fewer packages means less supply chain risk for a tool that will touch mail and sessions.
-- **Built on Claude Code itself**, not on a second agent framework. Session control uses what Claude
-  Code already offers (hooks, headless `claude -p --resume`).
+- **Built on Claude Code itself**, not on a second agent framework. Observing sessions uses what Claude
+  Code documents (hooks, `claude agents --json`); sending into running sessions is not implemented
+  (see [SESSION-CONTROL.md](SESSION-CONTROL.md)).
 - **Provider-neutral.** Twilio is the first phone provider because its webhook model is simple. The
   conversation logic does not know which provider is used.
 - **Safe by default.** The default provider places no call. Every dangerous capability is off until
@@ -48,7 +49,8 @@ Normal notifications stay in whatever chat channel you already use. The phone ri
 
 | Module | Job |
 |---|---|
-| `status.py` | Reads session status files, cleans every text field |
+| `status.py` | Reads session status files, cleans every text field; the chat's read-only `sessions` view (waiting first), optionally merged with `claude agents --json` |
+| `claude_status_hook.py` | The status hook, shipped inside the package (byte-identical to `hooks/claude_status_hook.py`) so `personal-agent hooks snippet` can point at it |
 | `escalation.py` | Decides whether an event may call: severity, de-duplication, interval, daily cap, quiet hours, acknowledgements |
 | `conversation.py` | The call as a deterministic state machine: PIN, alert, menu |
 | `telephony.py` | Fake provider, Twilio REST call, TwiML rendering, webhook signature check |
@@ -61,9 +63,13 @@ Normal notifications stay in whatever chat channel you already use. The phone ri
 | `vault.py` | The Markdown vault (the assistant's workspace): skeleton, note capture, relevant-note selection, safe fd-based file access |
 | `plugins.py` | Plugin checker (read-only, fd-based), enable/disable by checked copy plus digest registry, loading per chat start |
 | `brief.py` | Morning brief: deterministic content, Discord rendering and chunking, optional polish by the small model, once-per-day state and scheduler |
+| `tasks.py` | The task board (state_dir/tasks.json, atomic, flock, compare-and-set transitions), tier-1 task commands, helper prompt and result file rendering |
+| `coordinator.py` | Runs tasks in locked-down helper sessions (at most two), watchdog, cancel, quota and latch handling; the task facade for the router and delegation; counts-only Discord notices |
+| `domains.py` | Domain memory files (`wiki/domains/<domain>.md`): links (depth 1, at most five), skeleton creation, budgeted notes for helper prompts, tier-1 `domains`/`domain <name>` |
+| `console.py` | The chat terminal: one owner of stdin for `you>` and approval prompts, non-blocking notices |
 | `textsafe.py` | One definition of invisible and control characters for all untrusted text |
 | `remote.py` | Remote approvals: Discord webhook notice, one-time approval page, the chat-side channel |
-| `cli.py` | `serve`, `escalate`, `status`, `simulate`, `chat`, `vault`, `plugins`, `brief` |
+| `cli.py` | `serve`, `escalate`, `status`, `simulate`, `chat`, `vault`, `plugins`, `brief`, `hooks snippet` (prints only) |
 | `plugins/core/` (repo folder, not a module) | The shipped core plugin: skills `organize-inbox`, `daily-plan` and `capture-note` for the vault; checked like any other plugin |
 
 ## v1 scope (this release)
@@ -99,7 +105,7 @@ Later versions split the agent into processes with different rights:
 |---|---|---|
 | Watcher (v1) | session status files | place a call |
 | Mail reader (v3) | mailbox, read-only credentials | create **drafts** only |
-| Session controller (v2) | session list | send a message to a session **after your confirmation** |
+| Session controller | session list | **not implemented**, see [SESSION-CONTROL.md](SESSION-CONTROL.md) (no documented, stable mechanism) |
 
 The mail reader cannot reach the session controller's interface, and the session controller never
 receives raw mail text, only a short structured summary that you confirmed.
@@ -129,8 +135,9 @@ Before any level applies, the broker denies without asking:
 - writes to `.git/`, `.claude/`, `.mcp.json`, `.envrc`, `.vscode/`, `.idea/`, `.claude.json`, which
   would grant code execution or change the assistant's own configuration.
 
-Prompts are shown one at a time. At most three requests may queue; after two refusals in one turn
-the rest of that turn is denied. The prompt renders values as ASCII-escaped JSON, so control, bidi
+Prompts are shown one at a time, the main session's first (see 3d for helpers). At most three
+requests per session and six in total may queue; after two refusals in one turn the rest of that
+turn is denied. The prompt renders values as ASCII-escaped JSON, so control, bidi
 and look-alike characters are visible, and every cut is marked; a level-3 prompt shows the complete
 input when the short form would cut it. Typed-ahead input is discarded before a prompt, and a
 non-interactive stdin never approves. **Every failure is a deny**: no channel, timeout, a closed
@@ -222,8 +229,9 @@ Hence:
   `state_dir/plugins/<name>`. The registry (`plugins.json`, outside the plugins folder) holds the digest;
   a plugin edited afterwards is skipped at the next start. State and plugins folders must be real
   directories owned by the user and not writable by group or others. `core` and `cc-*` are reserved.
-- **Session hardening.** Every session (main and small) runs with `--strict-mcp-config` and
-  `--settings '{"disableAllHooks":true,"permissions":{"ask":["Skill"]}}'`. The broker allows a Skill
+- **Session hardening.** Every session (main, small and helpers) runs with `--strict-mcp-config` and
+  `--settings` holding `disableAllHooks`, `crossSessionInbound: refuse`, an `ask` rule for Skill and the
+  delegation tool, and deny rules for SendMessage, ListAgents, Task and Agent (see 3d). The broker allows a Skill
   call only for `<plugin>:<name>` of a loaded, checked plugin and denies everything else without asking.
   One `--plugin-dir` per plugin, never a parent folder. The small model session gets no plugins.
 - **Slash allowlist.** Only `/<plugin>:<name>` words enumerated by the checker pass; `!/config`,
@@ -273,6 +281,123 @@ outside service, and it runs unattended. Hence:
   counters per day keep a deleted, corrupt or unwritable state file from causing a post on every tick.
   Downtime past the grace window means no post that day and no catch-up. The state folder must be a real
   directory owned by the user and not writable by others.
+
+### 3d. Tasks and helpers
+
+The person hands work to the assistant in the chat (`task [@domain] <text>`); a helper does it in the
+background and the result lands in the vault. Decisions:
+
+- **Only inside a chat (D1).** Approvals need the person, so tasks run only while a `chat` is open,
+  never in `serve`. Queued tasks wait for the next chat; tasks older than `PA_TASK_MAX_AGE_H` expire
+  instead of starting a backlog unattended.
+- **The board.** `state_dir/tasks.json` (never in the vault; the workdir guard lists it), validated field
+  by field on every read, at most 1 MiB, 20 open and 200 kept tasks. Every mutation re-reads the file under
+  an flock on `tasks.lock` and is a compare-and-set on the task's status; saving is atomic. A second chat
+  may add, list, show and cancel; only the chat holding `tasks-owner.lock` claims, finishes and recovers
+  (a task left `running` by a crashed chat becomes `failed`). A second chat takes the owner lock over
+  as soon as the owner chat has closed (checked before each prompt and task command). A board update
+  that fails after a helper finished is retried on later ticks; a `running` record no worker owns is
+  ended. A board that becomes unreadable while the chat runs is set aside, reported in the chat, and the
+  running helpers' records are put back instead of being treated as cancelled. Once the chat closes,
+  no new helper starts: a claim that returns late goes back to the queue. Logs carry task ids, never text.
+- **Helpers.** Each task gets its own one-shot `claude -p` session in the vault with the main session's
+  hardening, `--no-session-persistence`, `--max-turns 30`, no plugins and no skills. Tools: Read, Glob,
+  Grep, plus Edit only when the task has a domain. No Skill, Task or Agent tool (allowlist, deny rules
+  and the init tripwire), no delegation tool, so a helper cannot start a helper. At most two run at
+  once. The quota guard is checked before each claim and again right before sending, with the lower
+  `PA_TASK_QUOTA_STOP`, so background work leaves headroom for the chat; without fresh quota data only
+  one helper runs as a probe; at most 30 task starts per day. A watchdog stops a helper after
+  `PA_TASK_TIMEOUT_S`.
+- **One broker, many scopes (D2).** The main session and each helper have their own approval scope:
+  token, MCP config file and turn state. A request is bound to a tool call announced in that very
+  session's stream, so a helper's token can never approve a main-session call or the reverse. All
+  scopes share one prompt queue, the main session first. A helper prompt waits at most two minutes,
+  is withdrawn when the main session needs the terminal (a deny, but neither a refusal nor part of the
+  helper's budget; the terminal says `[withdrawn: the chat needs the prompt]`), and a helper may show at
+  most three prompts per task. Prompt headers carry a trusted label (`[approval · task 3f2a9c
+  (research)]` versus `[approval · chat]`); the task title appears only quoted and ASCII-escaped.
+- **Write rules.** Helpers write through an allowlist: the only write they may ask for is an Edit that
+  appends up to three lines `- YYYY-MM-DD (task <own id>): finding` (at most 600 characters, no
+  heading, Links line, checkbox or invisible character) to their own `wiki/domains/<domain>.md`; the
+  prompt shows the complete appended text. Because Claude Code's Edit replaces `old_string` wherever it
+  occurs, the broker reads the file itself (no symlinks, 128 KiB cap) and allows the Edit only when
+  `old_string` is the file's tail, occurs nowhere else and starts at or after the `## Notes` heading; so
+  the result is exactly the old file plus the shown lines, never an insertion into the Links line, the
+  heading or an earlier note. Everything else, `outputs/` included, is denied without asking. Links
+  between domains stay editable by the person only.
+- **Results (D3).** The coordinator writes `outputs/tasks/<id>.md` with trusted code: a fixed header,
+  the request, then the helper's answer with invisible characters removed and every heading of it
+  (ATX with up to three spaces of indentation, setext underlines, raw HTML `<h1>`-`<h6>`) shown as plain
+  text, so it cannot fake the header block. The board stores its sha256; `task show` flags a file changed
+  since. The main session may never write `outputs/tasks/`, and a main turn that read task results or
+  domain notes (or searched the whole vault) marks its later approval prompts like note context. Claude
+  Code runs in-vault Read/Glob/Grep without asking the permission tool, so the mark is set from the
+  tool calls announced in the stream; the same check on permission requests is only a backup. Domain
+  notes are never attached to chat messages or to the brief.
+- **Delegation (D4, off by default).** With `PA_TASK_DELEGATION=on` the main session's `pa` server also
+  offers `delegate_task` (text up to 300 characters, optional domain). The `ask` rule routes it through
+  the permission tool; the broker allows at most one per turn, raises it to level 3 when the turn
+  carries note or skill context, and remembers the approved input digest. The delegation call itself
+  must present exactly that input, once, in the same turn; if the CLI does not route the call through
+  the permission tool, nothing is ever approved and every delegation is refused (fail-closed). The
+  model gets only the task id. A delegated task is shown to the helper as `<delegated-request>`, never
+  as the person's `<user-message>`, and is marked `[delegated]`. Delegation is offered (MCP flag,
+  system prompt paragraph, init tripwire) only when the chat's task service started; without one the
+  broker denies `delegate_task` without asking.
+- **Domains (AP3.2).** A task may name a domain; its file `wiki/domains/<domain>.md` has a `Links:`
+  line and an append-only `## Notes` section. Trusted code creates the skeleton on the first
+  `task @<domain>` (O_EXCL, no symlinks, at most 50 domains). The helper gets its own notes, then those of
+  linked domains (depth 1, at most five links, missing ones skipped), tail-trimmed to whole newest lines
+  within `PA_DOMAIN_CONTEXT_CHARS` (own up to 60 % when linked notes come too), inside a
+  `<domain-notes id="<random>">` block in front of the task; text, names and paths are escaped, so a
+  note cannot close the block, forge a `<user-message>` or attributes. Oversized prompts drop the notes.
+  Domain names are checked against `[a-z0-9]+(-[a-z0-9]+)*` (at most 32 characters) before any path is
+  built, and reads never follow symlinks and stop at 128 KiB. A turn with notes carries the context hint
+  on its approval prompts. Domain notes reach models only this way, never through the main session's
+  excerpts or the brief (`vault.CONTEXT_SKIP`).
+- **Notices.** The chat prints `[task <id> done: outputs/tasks/<id>.md]`, `failed`, `cancelled` and
+  `[tasks waiting: <reason>]` through a queue, so a worker never waits for the terminal. With
+  `PA_TASK_DISCORD=counts` the webhook gets at most one message per minute with counts only, never ids,
+  titles, domains, errors or paths.
+- **One safety latch.** All sessions share the Claude Code config dir and login, so a safety stop in
+  any of them (hook event, unexpected init, disallowed skill, output outside a turn) halts the chat and
+  aborts every running helper until restart.
+- **Our own sessions and other sessions.** The Claude Code docs (cross-session messaging) say a `-p`
+  session binds an inbox socket, so the user's other sessions could message it. Hence
+  `crossSessionInbound: refuse` and the deny rules, plus a tripwire in the bridge: conversation output
+  that arrives while no turn of ours runs stops the session before its events could be taken as an
+  answer or bound to an approval.
+- **Leftover processes.** Closing the chat aborts every helper (failed "interrupted (the chat was
+  closed)", never requeued) and SIGKILLs a process group that ignored SIGTERM; signals are sent only to
+  a child that was not yet reaped. If the chat itself is killed with SIGKILL, an orphaned helper keeps
+  its own process group, every approval fails because the socket is gone, it ends at stdin EOF after its
+  current turn, and `--max-turns` bounds that turn.
+
+### 3e. Other Claude Code sessions
+
+The person's other sessions belong to other projects and run with full user privileges, so the agent
+only **reads** about them:
+
+- **Sources.** By default the status files that `hooks/claude_status_hook.py` writes (UserPromptSubmit,
+  PreToolUse, Notification, Stop, StopFailure → error, SessionEnd). `personal-agent hooks snippet`
+  prints the settings snippet with absolute paths to the packaged copy of the hook; it never opens,
+  reads or writes a settings file, because `~/.claude` is the person's territory. Optionally
+  (`PA_SESSIONS_SOURCE=agents|both`) the documented `claude agents --json`, merged by session id with
+  Claude Code's state winning. That source is off by default: agent view is a research preview, and
+  whether the call starts its supervisor is undocumented.
+- **Privacy boundary.** The agents listing covers every project. It is read only for the typed tier-1
+  `sessions` command (never by `serve`, the scheduler, the waiting-session escalation, helpers or any
+  model path; a test checks the call sites), with a minimal environment (no API keys, never the
+  assistant's own config dir), stdin closed, a 5 s timeout with the process group killed, a 256 KiB
+  output cap, at most 100 entries and a 10 s cache. Only the basename of a working directory is kept,
+  every string is cleaned, and nothing from it is logged or sent to Discord or the phone.
+- **View.** Waiting sessions first, then error, working, idle; at most 20 lines. `status` and the
+  phone call keep their own order (errors first). Status files stay forgeable by any local process
+  of the person, which is why they may inform but never authorize anything.
+- **No control.** Research on 2026-10-18 (Claude Code 2.1.302) found no official, stable, documented
+  way for a separate process to send into a running session it does not host or to answer its
+  prompts. Session control is a documented design with threat model and required controls, marked
+  not implemented, in [SESSION-CONTROL.md](SESSION-CONTROL.md); there is no switch for it.
 
 ### 4. Caller authentication
 
@@ -331,7 +456,8 @@ session. A leading `!` forces the main session.
 |---|---|---|
 | **v1** | Escalation call, session status by phone, acknowledge, simulator | Noise and cost (limits), caller auth |
 | phase 2 | Vault workspace with note capture and note excerpts (done); checked plugins (done); morning brief (done); core skills plugin (done) | Injection from note text (delimited, escaped excerpts; slash allowlist); code execution and injection through plugins (checker, hooks off, Skill allowlist, tripwire); private text in Discord and send storms (counts by default, escaping, once-per-day state under a lock) |
-| v2 | Conversational call (speech in/out via a realtime voice pipeline such as Pipecat or LiveKit Agents), optional LLM summary of status; send a message to a waiting session after spoken confirmation + PIN | Injection from session text into the voice model |
+| phase 3 | Task board with background helpers, approval scopes, completion notices, optional self-delegation, domain memory files with links (done); a read-only `sessions` view of other Claude Code sessions and `hooks snippet` (done); session control documented as not implemented | Helpers starting helpers or writing outside their notes (tool allowlist, write allowlist, scopes); quota drain by unattended work (lower threshold, caps, expiry); injection through delegated text and results (approval, delimiting, no result back into the main session); privacy of other projects' sessions (basename only, opt-in agents source, never forwarded) |
+| v2 | Conversational call (speech in/out via a realtime voice pipeline such as Pipecat or LiveKit Agents), optional LLM summary of status; sending to a waiting session only if Claude Code documents a stable mechanism (see SESSION-CONTROL.md) | Injection from session text into the voice model |
 | v3 | Mail reader: classify and summarise mail, write reply **drafts**; approval flow (chat or phone) before sending | Injection from mail content, separate process and credentials |
 | v4 | Voice dashboard (status, numbers, news) | Exposure of a web UI, auth |
 | later | More providers (Telnyx, SIP), more languages, packaging (Docker image with 127.0.0.1 bindings) | — |
@@ -347,3 +473,15 @@ session. A leading `!` forces the main session.
   input (filled defaults, coerced types), every write is denied without a prompt. A mismatch is
   logged with the differing key names only. To be checked against the real CLI for Write and Edit,
   with and without optional keys, before relaxing the binding to id, name and path keys.
+- Phase 3 spike against the real CLI (manual, never in CI): whether 2.1.302 accepts
+  `crossSessionInbound` and deny rules for tools it may not offer without breaking startup; whether
+  `refuse` is effective (`/list-agents` from another session cannot deliver to a bridge session) and
+  whether bridge sessions appear there at all despite their own `CLAUDE_CONFIG_DIR` (the socket
+  fallback directory is per user, not per config dir); whether `--max-turns` works with stream-json
+  input; and whether the `ask` rule routes `mcp__pa__delegate_task` through the permission tool (if not,
+  delegation stays refused, fail-closed). If a key breaks startup it is not simply dropped: the
+  `--tools` allowlist and the out-of-turn tripwire stay, and bare mode is the alternative to evaluate.
+  Record the results here.
+- Whether `claude agents --json` starts the agent-view supervisor, and its exact field formats (e.g.
+  `startedAt` as number or ISO string): undocumented, so the agents source stays opt-in and the reader
+  accepts both. Check once by hand before recommending it.

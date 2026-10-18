@@ -817,7 +817,7 @@ def test_chat_write_is_approved(chat, capsys):
     assert chat.run(["WRITE a.txt", "/exit"], ["y"]) == 0
     out = capsys.readouterr().out
     assert (chat.state / "vault" / "a.txt").read_text() == "x"
-    assert "[approval] level 2 (write): Write" in out and "agent[3]> wrote a.txt" in out
+    assert "[approval · chat] level 2 (write): Write" in out and "agent[3]> wrote a.txt" in out
     entry = json.loads(chat.log.read_text().splitlines()[0])
     args = entry["args"]
     assert args[args.index("--tools") + 1] == "Read,Glob,Grep,Write,Edit,Skill"
@@ -894,7 +894,7 @@ def test_chat_error_while_a_prompt_is_open_ends_the_prompt(chat, monkeypatch, ca
     assert main(["chat"]) == 0
     elapsed = time.monotonic() - started
     out = capsys.readouterr().out
-    assert "[approval] level 2 (write): Write" in out  # the prompt really was open
+    assert "[approval · chat] level 2 (write): Write" in out  # the prompt really was open
     assert "[error]" in out and "[approved]" not in out
     assert elapsed < 10, elapsed  # not the 30 s approval timeout
     assert not (chat.state / "vault" / "a.txt").exists()

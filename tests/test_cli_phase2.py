@@ -17,7 +17,10 @@ from personal_agent.config import Config, ConfigError
 FAKE = Path(__file__).resolve().parent / "fake_claude.py"
 ENV_NAMES = ("PA_WORKDIR", "PA_VAULT_DIR", "PA_VAULT_CONTEXT_CHARS", "PA_CLAUDE_CONFIG_DIR", "PA_STATUS_DIR",
              "PA_QUOTA_STOP", "PA_ROUTER_SMALL_MODEL", "PA_CLAUDE_MODEL", "PA_LANGUAGE", "PA_DISCORD_WEBHOOK",
-             "PA_PUBLIC_APPROVAL_URL", "PA_BRIEF_TIME", "PA_BRIEF_GRACE_MIN", "PA_BRIEF_POLISH", "PA_BRIEF_DISCORD")
+             "PA_PUBLIC_APPROVAL_URL", "PA_BRIEF_TIME", "PA_BRIEF_GRACE_MIN", "PA_BRIEF_POLISH", "PA_BRIEF_DISCORD",
+             "PA_SESSIONS_SOURCE", "PA_TASKS", "PA_TASK_PARALLEL", "PA_TASK_MODEL", "PA_TASK_TIMEOUT_S",
+             "PA_TASK_QUOTA_STOP", "PA_TASK_DISCORD", "PA_TASK_DELEGATION", "PA_TASK_MAX_AGE_H",
+             "PA_DOMAIN_CONTEXT_CHARS")
 
 
 @pytest.fixture
@@ -243,3 +246,81 @@ def test_turn_context_marks_approval_requests(tmp_path, monkeypatch):
     request = approval.ApprovalRequest("Write", Level.WRITE, "a.md", "t", context="note context in this turn")
     assert channel.ask(request, deadline=time.monotonic() + 5)
     assert any("may come from note text or a plugin skill" in line for line in lines)
+
+
+# --- phase 3: task state files and configuration ------------------------------------------
+
+TASK_ENV = ("PA_TASKS", "PA_TASK_PARALLEL", "PA_TASK_MODEL", "PA_TASK_TIMEOUT_S", "PA_TASK_QUOTA_STOP",
+            "PA_TASK_DISCORD", "PA_TASK_DELEGATION", "PA_TASK_MAX_AGE_H", "PA_DOMAIN_CONTEXT_CHARS")
+
+
+def test_vault_must_not_contain_the_task_board(env, monkeypatch, capsys):
+    from personal_agent.cli import STATE_ENTRIES
+
+    assert {"tasks.json", "tasks.lock", "tasks-owner.lock"} <= set(STATE_ENTRIES)
+    vault = env.tmp / "v"
+    vault.mkdir()
+    monkeypatch.setenv("PA_STATE_DIR", str(vault))  # state files would land inside the vault
+    monkeypatch.setenv("PA_VAULT_DIR", str(vault))
+    assert main(["vault", "init"]) == 2
+    assert "workdir must not contain" in capsys.readouterr().err
+
+
+def test_task_config_defaults_and_values(env, monkeypatch):
+    for name in TASK_ENV:
+        monkeypatch.delenv(name, raising=False)
+    config = Config.from_env()
+    assert (config.tasks_enabled, config.task_parallel, config.task_model, config.task_timeout_s,
+            config.task_quota_stop, config.task_discord, config.task_delegation, config.task_max_age_h) == (
+        True, 2, None, 900, 0.8, "off", False, 24)
+    monkeypatch.setenv("PA_QUOTA_STOP", "0.7")
+    assert Config.from_env().task_quota_stop == 0.7  # never above the chat's threshold
+    monkeypatch.setenv("PA_TASKS", "off")
+    monkeypatch.setenv("PA_TASK_PARALLEL", "1")
+    monkeypatch.setenv("PA_TASK_MODEL", "haiku")
+    monkeypatch.setenv("PA_TASK_TIMEOUT_S", "60")
+    monkeypatch.setenv("PA_TASK_QUOTA_STOP", "0.5")
+    monkeypatch.setenv("PA_TASK_DISCORD", "counts")
+    monkeypatch.setenv("PA_TASK_DELEGATION", "on")
+    monkeypatch.setenv("PA_TASK_MAX_AGE_H", "48")
+    config = Config.from_env()
+    assert (config.tasks_enabled, config.task_parallel, config.task_model, config.task_timeout_s,
+            config.task_quota_stop, config.task_discord, config.task_delegation, config.task_max_age_h) == (
+        False, 1, "haiku", 60, 0.5, "counts", True, 48)
+
+
+def test_domain_context_config(env, monkeypatch):
+    monkeypatch.delenv("PA_DOMAIN_CONTEXT_CHARS", raising=False)
+    assert Config.from_env().domain_context_chars == 4000
+    for value in ("0", "8000"):
+        monkeypatch.setenv("PA_DOMAIN_CONTEXT_CHARS", value)
+        assert Config.from_env().domain_context_chars == int(value)
+
+
+@pytest.mark.parametrize("name, value", [
+    ("PA_TASKS", "maybe-secret"),
+    ("PA_TASK_PARALLEL", "3"),
+    ("PA_TASK_PARALLEL", "0"),
+    ("PA_TASK_TIMEOUT_S", "59"),
+    ("PA_TASK_TIMEOUT_S", "3601"),
+    ("PA_TASK_QUOTA_STOP", "0.95"),
+    ("PA_TASK_QUOTA_STOP", "-0.25"),
+    ("PA_TASK_DISCORD", "full"),
+    ("PA_TASK_DELEGATION", "sometimes"),
+    ("PA_TASK_MAX_AGE_H", "9999"),
+    ("PA_DOMAIN_CONTEXT_CHARS", "8001"),
+    ("PA_DOMAIN_CONTEXT_CHARS", "-1"),
+    ("PA_DOMAIN_CONTEXT_CHARS", "lots-secret"),
+    ("PA_SESSIONS_SOURCE", "phone-secret"),
+])
+def test_task_config_errors_never_echo_the_value(env, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError) as info:
+        Config.from_env()
+    assert name in str(info.value) and value not in str(info.value)
+
+
+def test_task_discord_without_webhook_warns_in_the_chat(chat, monkeypatch, capsys):
+    monkeypatch.setenv("PA_TASK_DISCORD", "counts")
+    assert chat.run(["/exit"]) == 0
+    assert "PA_TASK_DISCORD=counts needs PA_DISCORD_WEBHOOK" in capsys.readouterr().out

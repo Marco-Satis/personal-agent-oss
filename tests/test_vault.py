@@ -357,3 +357,68 @@ def test_write_output(tmp_path, vault):
     with pytest.raises(VaultError, match="unsafe path"):
         vault.write_output("brief-2026-10-18.md", "x")
     assert not (tmp_path / "brief-2026-10-18.md").exists()
+
+
+# --- phase 3: task results, safe create/read, helper data stays out of context ----------------
+
+import stat as _stat  # noqa: E402
+
+from personal_agent.vault import MAX_RESULT_CHARS, VaultError as _VaultError  # noqa: E402
+from personal_agent.vault import Vault as _Vault  # noqa: E402
+
+
+def _fresh_vault(tmp_path):
+    v = _Vault(tmp_path / "v")
+    v.init()
+    return v
+
+
+def test_task_results_roundtrip_and_cap(tmp_path):
+    v = _fresh_vault(tmp_path)
+    assert v.write_task_result("abc123", "hello") == "outputs/tasks/abc123.md"
+    path = v.root / "outputs" / "tasks" / "abc123.md"
+    assert path.read_text() == "hello" and _stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert v.read_task_result("abc123") == "hello" and v.task_result_exists("abc123")
+    assert not v.task_result_exists("ffffff")
+    v.write_task_result("abc123", "x" * (MAX_RESULT_CHARS + 10))
+    assert v.read_task_result("abc123").endswith("…(cut)")
+    for bad in ("ABC123", "../x", "abc12", "abc1234"):
+        with pytest.raises(_VaultError):
+            v.write_task_result(bad, "x")
+
+
+def test_task_result_refuses_a_symlinked_folder(tmp_path):
+    v = _fresh_vault(tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    (v.root / "outputs" / "tasks").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(_VaultError):
+        v.write_task_result("abc123", "x")
+    assert list((tmp_path / "elsewhere").iterdir()) == []
+    assert v.read_task_result("abc123") is None
+
+
+def test_create_file_and_read_text(tmp_path):
+    v = _fresh_vault(tmp_path)
+    assert v.create_file("wiki/domains/research.md", "# Domain: research\n") == "created"
+    assert v.create_file("wiki/domains/research.md", "other") == "kept"
+    assert v.read_text("wiki/domains/research.md", 1000) == "# Domain: research\n"
+    (v.root / "wiki" / "domains" / "evil.md").symlink_to(tmp_path / "target.md")
+    assert v.create_file("wiki/domains/evil.md", "x") == "skipped"
+    assert not (tmp_path / "target.md").exists()
+    assert v.read_text("wiki/domains/evil.md", 1000) is None
+    for bad in ("../x.md", "/etc/passwd", "wiki/../x.md", ".hidden/x.md"):
+        with pytest.raises(_VaultError):
+            v.create_file(bad, "x")
+        assert v.read_text(bad, 100) is None
+    assert v.read_text("wiki/domains/research.md", 5) is None  # over the cap
+
+
+def test_domain_notes_stay_out_of_context_and_brief(tmp_path):
+    v = _fresh_vault(tmp_path)
+    (v.root / "wiki" / "domains").mkdir()
+    (v.root / "wiki" / "domains" / "a.md").write_text("# boiler\n- [ ] injected boiler task\n")
+    (v.root / "wiki" / "boiler.md").write_text("# Boiler\n- [ ] real boiler task\n")
+    tasks, _total = v.open_tasks()
+    assert [t.text for t in tasks] == ["real boiler task"]
+    excerpts = v.select_context("boiler task", 3000)
+    assert excerpts and all(not e.path.startswith("wiki/domains") for e in excerpts)

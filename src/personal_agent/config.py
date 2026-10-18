@@ -14,6 +14,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .status import SESSION_SOURCES
+
 
 class ConfigError(ValueError):
     pass
@@ -124,6 +126,22 @@ def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipa
 
 _BRIEF_TIME = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 BRIEF_DISCORD_MODES = ("counts", "full")
+TASK_DISCORD_MODES = ("off", "counts")
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """on/off switch; the error never echoes the value."""
+    raw = _env(name)
+    if raw is None:
+        return default
+    value = raw.lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    raise ConfigError(f"{name} must be 'on' or 'off'")
 
 
 def _parse_brief_time(raw: str | None) -> tuple[int, int] | None:
@@ -191,6 +209,16 @@ class Config:
     brief_grace_min: int = 120
     brief_polish: bool = False
     brief_discord: str = "counts"  # "counts": only counts go to Discord; "full": the escaped text
+    tasks_enabled: bool = True       # PA_TASKS
+    task_parallel: int = 2           # PA_TASK_PARALLEL, 1..2
+    task_model: str | None = None    # PA_TASK_MODEL; None: the chat's model
+    task_timeout_s: int = 900        # PA_TASK_TIMEOUT_S
+    task_quota_stop: float = 0.8     # PA_TASK_QUOTA_STOP, at most quota_stop
+    task_discord: str = "off"        # PA_TASK_DISCORD: off | counts
+    task_delegation: bool = False    # PA_TASK_DELEGATION
+    task_max_age_h: int = 24         # PA_TASK_MAX_AGE_H: older queued tasks expire
+    domain_context_chars: int = 4000  # PA_DOMAIN_CONTEXT_CHARS: domain notes per helper prompt, 0 = none
+    sessions_source: str = "hooks"   # PA_SESSIONS_SOURCE: hooks | agents | both (chat `sessions` only)
 
     @property
     def remote_approvals(self) -> bool:
@@ -260,6 +288,28 @@ class Config:
         brief_discord = (_env("PA_BRIEF_DISCORD", "counts") or "counts").lower()
         if brief_discord not in BRIEF_DISCORD_MODES:
             raise ConfigError("PA_BRIEF_DISCORD must be 'counts' or 'full'")
+        tasks_enabled = _env_bool("PA_TASKS", True)
+        task_parallel = _env_int("PA_TASK_PARALLEL", 2)
+        if not 1 <= task_parallel <= 2:
+            raise ConfigError("PA_TASK_PARALLEL must be 1 or 2")
+        task_timeout_s = _env_int("PA_TASK_TIMEOUT_S", 900)
+        if not 60 <= task_timeout_s <= 3600:
+            raise ConfigError("PA_TASK_TIMEOUT_S must be between 60 and 3600 seconds")
+        task_quota_stop = _env_float("PA_TASK_QUOTA_STOP", min(0.8, quota_stop))
+        if not 0 < task_quota_stop <= quota_stop:
+            raise ConfigError("PA_TASK_QUOTA_STOP must be greater than 0 and at most PA_QUOTA_STOP")
+        task_discord = (_env("PA_TASK_DISCORD", "off") or "off").lower()
+        if task_discord not in TASK_DISCORD_MODES:
+            raise ConfigError("PA_TASK_DISCORD must be 'off' or 'counts'")
+        task_max_age_h = _env_int("PA_TASK_MAX_AGE_H", 24)
+        if not 1 <= task_max_age_h <= 24 * 30:
+            raise ConfigError("PA_TASK_MAX_AGE_H must be between 1 and 720 hours")
+        domain_context_chars = _env_int("PA_DOMAIN_CONTEXT_CHARS", 4000)
+        if not 0 <= domain_context_chars <= 8000:
+            raise ConfigError("PA_DOMAIN_CONTEXT_CHARS must be between 0 and 8000 (0 attaches no domain notes)")
+        sessions_source = (_env("PA_SESSIONS_SOURCE", "hooks") or "hooks").lower()
+        if sessions_source not in SESSION_SOURCES:
+            raise ConfigError("PA_SESSIONS_SOURCE must be 'hooks', 'agents' or 'both'")
 
         return cls(
             state_dir=state_dir,
@@ -298,6 +348,16 @@ class Config:
             brief_grace_min=brief_grace_min,
             brief_polish=(_env("PA_BRIEF_POLISH", "") or "").lower() in ("1", "true", "yes"),
             brief_discord=brief_discord,
+            tasks_enabled=tasks_enabled,
+            task_parallel=task_parallel,
+            task_model=_env("PA_TASK_MODEL"),
+            task_timeout_s=task_timeout_s,
+            task_quota_stop=task_quota_stop,
+            task_discord=task_discord,
+            task_delegation=_env_bool("PA_TASK_DELEGATION", False),
+            task_max_age_h=task_max_age_h,
+            domain_context_chars=domain_context_chars,
+            sessions_source=sessions_source,
         )
 
     def validate_for_serve(self) -> None:

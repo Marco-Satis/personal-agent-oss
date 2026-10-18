@@ -5,8 +5,13 @@ Writes one small JSON file per session into the status directory
 (PA_STATUS_DIR, default ~/.local/state/personal-agent/sessions). The agent only
 reads these files. The hook never blocks Claude Code: it always exits 0.
 
-Register it for the events UserPromptSubmit, Notification, Stop and SessionEnd
-(see README.md for the settings.json snippet).
+Register it for the events UserPromptSubmit, PreToolUse, Notification, Stop,
+StopFailure (a turn ended by an API error) and SessionEnd. `personal-agent hooks
+snippet` prints the settings snippet; it never edits a settings file itself.
+
+Standard library only and no package imports, so it runs with `python3 -I -S`.
+A copy ships inside the package (personal_agent/claude_status_hook.py); both
+files are kept byte-identical.
 """
 
 import json
@@ -20,7 +25,9 @@ STATE_BY_EVENT = {
     "PreToolUse": "working",
     "Notification": "waiting",
     "Stop": "idle",
+    "StopFailure": "error",
 }
+ERROR_SUMMARY = "the turn ended with an API error"
 
 
 def status_dir() -> Path:
@@ -55,7 +62,11 @@ def main() -> None:
     except (OSError, ValueError, TypeError, AttributeError):
         pass
 
-    summary = str(data.get("message", ""))[:200] if state == "waiting" else ""
+    summary = ""
+    if state == "waiting":
+        summary = str(data.get("message", ""))[:200]
+    elif state == "error":
+        summary = ERROR_SUMMARY
     record = {
         "session_id": session_id,
         "project": Path(str(data.get("cwd", ""))).name or "unknown",

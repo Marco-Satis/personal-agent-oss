@@ -27,24 +27,28 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from .bridge import MAX_PROMPT_CHARS, SKILL_TOOL
+from .bridge import MAX_PROMPT_CHARS, SKILL_TOOL, UnexpectedOutput
 from .quota import RESET_COMMAND, SUBSCRIPTION_KEY_SOURCE, QuotaGuard, is_overage
-from .status import SessionStatus, clean_text, format_status_line
+from .status import SessionStatus, clean_text, format_status_line, render_sessions, views_from_statuses
 from .textsafe import is_unsafe
+from .tasks import Command, parse_command
 from .vault import Vault, VaultError, render_context
 
 if TYPE_CHECKING:
     from .bridge import ClaudeSession, TurnResult
+    from .coordinator import TaskService
+    from .domains import Domains
 
 log = logging.getLogger(__name__)
 
 FORCE_PREFIX = "!"
 FIXED_COMMANDS = {
     "help": ("help", "/help", "?", "hilfe"),
-    "status": ("status", "/status", "sessions"),
+    "status": ("status", "/status"),
     "quota": ("quota", "/quota", "usage", "kontingent"),
     "quota_reset": (RESET_COMMAND, "/" + RESET_COMMAND),
 }
@@ -102,6 +106,49 @@ class PaidUsageStop(SafetyStop):
 
 class UnsafeInput(SafetyStop):
     """Raised before anything is sent: the body must not reach Claude Code."""
+
+
+class SafetyLatch:
+    """One safety stop for every session of a chat: the main session and all helpers.
+
+    The sessions share the Claude Code config dir and login, so a hook or plugin
+    surprise in one is a risk for all. The first reason wins; listeners (e.g. the
+    task coordinator, which then stops its helpers) are told once. Thread-safe.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reason: str | None = None
+        self._listeners: list[Callable[[str], None]] = []
+
+    def trip(self, reason: str) -> None:
+        with self._lock:
+            if self._reason is not None:
+                return
+            self._reason = clean_text(reason, 120) or "safety stop"
+            reason_text = self._reason
+            listeners = list(self._listeners)
+        log.warning("safety latch tripped: %s", reason_text)
+        for listener in listeners:
+            try:
+                listener(reason_text)
+            except Exception as exc:  # noqa: BLE001 - a listener must never undo the stop
+                log.warning("safety latch listener failed: %s", type(exc).__name__)
+
+    def add_listener(self, listener: Callable[[str], None]) -> None:
+        with self._lock:
+            self._listeners.append(listener)
+            reason = self._reason
+        if reason is not None:
+            listener(reason)
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def __bool__(self) -> bool:
+        return self.reason is not None
 
 
 def prefix_command(text: str) -> tuple[str, str] | None:
@@ -206,7 +253,7 @@ def init_problem(event: dict, config: object) -> str | None:
     expected_plugins = frozenset(getattr(config, "expected_plugins", ()) or ())
     expected_mcp = frozenset(getattr(config, "expected_mcp", ()) or ())
     plugin_dirs = tuple(getattr(config, "plugin_dirs", ()) or ())
-    tools = set(getattr(config, "tools", ()) or ())
+    tools = set(getattr(config, "tools", ()) or ()) | set(getattr(config, "extra_tools", ()) or ())
     permission_tool = getattr(config, "permission_tool", None)
     if permission_tool:
         tools.add(permission_tool)
@@ -334,7 +381,10 @@ def guarded_send(
         if on_event is not None:
             on_event(event)
 
-    return session.send(body, on_event=wrapped)
+    try:
+        return session.send(body, on_event=wrapped)
+    except UnexpectedOutput as exc:
+        raise SafetyStop(str(exc)) from exc
 
 
 class Router:
@@ -351,6 +401,10 @@ class Router:
         context_chars: int = 0,
         slash_commands: frozenset[str] = frozenset(),
         on_context: Callable[[str], None] | None = None,
+        latch: SafetyLatch | None = None,
+        tasks: "TaskService | None" = None,
+        domains: "Domains | None" = None,
+        sessions: Callable[[], str] | None = None,
     ) -> None:
         self.main = main
         self.small = small if config.small_model else None
@@ -361,13 +415,30 @@ class Router:
         self.context_chars = max(0, context_chars)
         self.slash_commands = frozenset(slash_commands)  # exact "/<plugin>:<name>" words
         self.on_context = on_context  # told before a turn with notes or a plugin command is sent
-        self.halted: str | None = None  # set by a safety stop; later turns are refused
+        # Shared with the task coordinator: a safety stop in a helper refuses further
+        # turns here, and a stop here pauses and stops the helpers.
+        self.latch = latch if latch is not None else SafetyLatch()
+        self.tasks = tasks  # None: PA_TASKS=off
+        self.domains = domains  # None: no vault
+        # The read-only `sessions` view; None: built from the hook status files only.
+        self.sessions = sessions
+
+    @property
+    def halted(self) -> str | None:
+        """The safety-stop reason; later turns are refused."""
+        return self.latch.reason
+
+    @halted.setter
+    def halted(self, reason: str | None) -> None:
+        if reason:
+            self.latch.trip(reason)
 
     # --- tier 1 ---------------------------------------------------------------
 
     def help_text(self) -> str:
         lines = [
             "Commands answered without a model: help, status (your Claude Code sessions), "
+            "sessions (the same, waiting ones first; read-only), "
             f"quota (subscription usage), {RESET_COMMAND} (forget the saved usage data), /exit.",
         ]
         if self.small is not None:
@@ -385,7 +456,50 @@ class Router:
             )
         if self.slash_commands:
             lines.append("Plugin skills: " + ", ".join(sorted(self.slash_commands)) + " (e.g. /core:<skill>).")
+        if self.tasks is not None:
+            lines.append(
+                "Background tasks: task [@domain] <text> hands work to a helper; tasks lists them; "
+                "task show <id>, task cancel <id>. Results go to outputs/tasks/<id>.md."
+            )
+        if self.domains is not None:
+            lines.append(
+                "Domains (memory per topic for tasks, wiki/domains/<name>.md): domains lists them; "
+                "domain <name> shows one."
+            )
         return "\n".join(lines)
+
+    def _domain_command(self, command: "Command") -> Reply:
+        if command.kind == "domain_usage":
+            return Reply("usage: domains · domain <name> (lowercase letters, digits and dashes)", 1)
+        if self.domains is None:
+            return Reply("domains need a vault", 1, is_error=True)
+        try:
+            if command.kind == "domains":
+                return Reply(self.domains.list_text(), 1)
+            return Reply(self.domains.show(command.arg), 1)
+        except (OSError, VaultError) as exc:
+            return Reply(f"domains unavailable: {type(exc).__name__}", 1, is_error=True)
+
+    def _sessions(self) -> Reply:
+        """The person's Claude Code sessions, waiting first. Read-only: nothing is sent anywhere."""
+        try:
+            if self.sessions is not None:
+                return Reply(self.sessions(), 1)
+            return Reply(render_sessions(views_from_statuses(self.statuses())), 1)
+        except Exception as exc:  # noqa: BLE001 - a broken source must not end the chat
+            return Reply(f"sessions unavailable: {type(exc).__name__}", 1, is_error=True)
+
+    def _task_command(self, command: "Command") -> Reply:
+        if command.kind == "sessions":
+            return self._sessions()
+        if command.kind.startswith("domain"):
+            return self._domain_command(command)
+        if command.kind == "task_usage":
+            return Reply("usage: task [@domain] <text> · tasks · task show <id> · task cancel <id>", 1)
+        if self.tasks is None:
+            return Reply("tasks are off (PA_TASKS=off)", 1, is_error=True)
+        text, is_error = self.tasks.command(command)
+        return Reply(text, 1, is_error=is_error)
 
     def _note(self, argument: str) -> Reply:
         if not argument:
@@ -433,6 +547,9 @@ class Router:
         prefixed = prefix_command(text)
         if prefixed is not None:
             return self._note(prefixed[1])
+        command = parse_command(text)
+        if command is not None:
+            return self._task_command(command)  # tier 1: no quota, works while halted
         tier, body = choose_tier(text, self.config)
         if tier == 1:
             return Reply(self._fixed(body), 1)
