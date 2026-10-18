@@ -45,6 +45,11 @@ def _parse_quiet_hours(raw: str | None) -> tuple[int, int] | None:
     return start, end
 
 
+def _optional_path(name: str) -> Path | None:
+    raw = _env(name)
+    return Path(raw).expanduser() if raw else None
+
+
 def _default_state_dir() -> Path:
     base = _env("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     return Path(base) / "personal-agent"
@@ -75,6 +80,17 @@ class Config:
     waiting_escalate_min: int = 0
     status_max_age_min: int = 24 * 60
     twilio: TwilioConfig | None = field(default=None, repr=False)
+    claude_bin: str = "claude"
+    claude_model: str = "sonnet"
+    workdir: Path | None = None
+    claude_config_dir: Path | None = None
+    claude_oauth_token: str | None = field(default=None, repr=False)
+
+    def bridge_paths(self) -> tuple[Path, Path]:
+        """Working directory and Claude Code config directory for the assistant."""
+        workdir = self.workdir or self.state_dir / "workspace"
+        config_dir = self.claude_config_dir or self.state_dir / "claude-config"
+        return workdir, config_dir
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -115,6 +131,11 @@ class Config:
             waiting_escalate_min=_env_int("PA_WAITING_ESCALATE_MIN", 0),
             status_max_age_min=_env_int("PA_STATUS_MAX_AGE_MIN", 24 * 60),
             twilio=twilio,
+            claude_bin=_env("PA_CLAUDE_BIN", "claude") or "claude",
+            claude_model=_env("PA_CLAUDE_MODEL", "sonnet") or "sonnet",
+            workdir=_optional_path("PA_WORKDIR"),
+            claude_config_dir=_optional_path("PA_CLAUDE_CONFIG_DIR"),
+            claude_oauth_token=_env("CLAUDE_CODE_OAUTH_TOKEN"),
         )
 
     def validate_for_serve(self) -> None:

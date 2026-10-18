@@ -86,6 +86,58 @@ def _cmd_simulate(config: Config, args: argparse.Namespace) -> int:
             turn = call.handle(speech=entered or None)
 
 
+def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
+    """Talk to the assistant in the terminal. Read-only tools until approvals exist."""
+    from .bridge import BridgeConfig, BridgeError, ClaudeSession
+
+    workdir, config_dir = config.bridge_paths()
+    session = ClaudeSession(
+        BridgeConfig(
+            workdir=workdir,
+            config_dir=config_dir,
+            claude_bin=config.claude_bin,
+            model=args.model or config.claude_model,
+            oauth_token=config.claude_oauth_token,
+        )
+    )
+
+    def show(event: dict) -> None:
+        if event.get("type") != "assistant":
+            return
+        for block in (event.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                print(f"  [tool: {block.get('name')}]")
+
+    print(f"[workdir {workdir} · /exit to quit]")
+    try:
+        while True:
+            try:
+                text = input("you> ").strip()
+            except EOFError:
+                break
+            if text in ("/exit", "/quit"):
+                break
+            if not text:
+                continue
+            try:
+                result = session.send(text, on_event=show)
+            except BridgeError as exc:
+                print(f"[error] {exc}")
+                continue
+            print(f"agent> {result.text}")
+            if result.is_error:
+                print(f"[turn ended with an error ({result.subtype})]")
+                if "logged in" in result.text.lower():
+                    print(
+                        f"[the assistant uses its own Claude Code config in {config_dir}: "
+                        "run `claude setup-token` once and set CLAUDE_CODE_OAUTH_TOKEN, "
+                        "or point PA_CLAUDE_CONFIG_DIR at an existing login]"
+                    )
+    finally:
+        session.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="personal-agent", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -104,6 +156,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sim = sub.add_parser("simulate", help="play a phone call in the terminal (no provider needed)")
     sim.add_argument("--summary", default="This is a test alert.")
+
+    chat = sub.add_parser("chat", help="talk to the assistant (Claude Code, locked down)")
+    chat.add_argument("--model", default=None, help="model alias, default PA_CLAUDE_MODEL or sonnet")
     return parser
 
 
@@ -112,6 +167,7 @@ COMMANDS = {
     "escalate": _cmd_escalate,
     "status": _cmd_status,
     "simulate": _cmd_simulate,
+    "chat": _cmd_chat,
 }
 
 

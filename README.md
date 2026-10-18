@@ -59,7 +59,26 @@ See what the agent sees:
 personal-agent status
 ```
 
-## Connect Claude Code
+## Talk to the assistant (preview)
+
+The assistant runs on your own Claude subscription through the unmodified Claude Code CLI, locked down:
+restricted mode (no shell, file tools only in its own workspace), an explicit tool allowlist, only its own
+MCP servers, and no API keys in its environment, so it never falls back to paid API usage.
+
+```bash
+claude setup-token                       # once; keep the token in your password manager
+export CLAUDE_CODE_OAUTH_TOKEN=...       # or PA_CLAUDE_CONFIG_DIR pointing at an existing login
+personal-agent chat                      # read-only tools for now; approvals for writing come next
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PA_CLAUDE_MODEL` | `sonnet` | model alias |
+| `PA_WORKDIR` | `$PA_STATE_DIR/workspace` | the only folder the assistant's file tools can touch |
+| `PA_CLAUDE_CONFIG_DIR` | `$PA_STATE_DIR/claude-config` | separate Claude Code config, never your `~/.claude` by default |
+| `PA_CLAUDE_BIN` | `claude` | path to the Claude Code CLI |
+
+## Connect your Claude Code sessions
 
 Add the status hook to `~/.claude/settings.json` (adjust the path):
 
