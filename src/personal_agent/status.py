@@ -51,9 +51,9 @@ class SessionStatus:
         return int(((now or time.time()) - self.since) // 60)
 
 
-def format_status_line(s: SessionStatus) -> str:
+def format_status_line(s: SessionStatus, now: float | None = None) -> str:
     """One terminal line per session: state, minutes in that state, project, summary."""
-    return f"{s.state:8} {s.age_minutes():4} min  {s.project:20} {s.summary}"
+    return f"{s.state:8} {s.age_minutes(now):4} min  {s.project:20} {s.summary}"
 
 
 def _parse(path: Path) -> SessionStatus | None:

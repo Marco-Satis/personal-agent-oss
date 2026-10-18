@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from personal_agent.bridge import (
+    HARDENED_SETTINGS,
     BridgeConfig,
     BridgeError,
     ClaudeSession,
@@ -60,6 +61,29 @@ def test_args_optional_parts(tmp_path):
     assert args[args.index("--permission-prompt-tool") + 1] == "mcp__pa__approve"
     assert args.count("--plugin-dir") == 2
     assert args[args.index("--resume") + 1] == "abc"
+
+
+def test_args_always_disable_hooks_and_ask_for_skills(tmp_path):
+    args = build_args(BridgeConfig(workdir=tmp_path, config_dir=tmp_path, tools=()))
+    index = args.index("--strict-mcp-config")
+    assert args[index + 1] == "--settings"
+    settings = json.loads(args[index + 2])
+    assert args[index + 2] == HARDENED_SETTINGS
+    assert settings == {"disableAllHooks": True, "permissions": {"ask": ["Skill"]}}
+    assert args[args.index("--tools") + 1] == ""
+
+
+def test_one_plugin_dir_flag_per_plugin_in_order(tmp_path):
+    dirs = (tmp_path / "core", tmp_path / "b", tmp_path / "a")
+    args = build_args(BridgeConfig(workdir=tmp_path, config_dir=tmp_path, plugin_dirs=dirs))
+    values = [args[i + 1] for i, arg in enumerate(args) if arg == "--plugin-dir"]
+    assert values == [str(d) for d in dirs]
+
+
+def test_chat_tools_include_skill():
+    from personal_agent.cli import CHAT_TOOLS
+
+    assert "Skill" in CHAT_TOOLS
 
 
 def test_env_never_passes_api_keys(tmp_path):
@@ -157,4 +181,4 @@ def test_chat_cli_with_fake(tmp_path, fake_bin, monkeypatch, capsys):
     assert main(["chat"]) == 0
     out = capsys.readouterr().out
     assert "agent[3]> echo: hello" in out
-    assert os.path.isdir(tmp_path / "state" / "workspace")
+    assert os.path.isdir(tmp_path / "state" / "vault")

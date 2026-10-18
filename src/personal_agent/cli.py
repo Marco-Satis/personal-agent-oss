@@ -1,4 +1,4 @@
-"""Command line: serve, escalate, status, simulate, chat."""
+"""Command line: serve, escalate, status, simulate, chat, vault, plugins, brief."""
 
 from __future__ import annotations
 
@@ -106,7 +106,10 @@ def _cmd_simulate(config: Config, args: argparse.Namespace) -> int:
             turn = call.handle(speech=entered or None)
 
 
-CHAT_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit")
+# "Skill" lets the model use the skills of the checked plugins. The bridge routes every
+# Skill call through the permission tool (HARDENED_SETTINGS), where the broker allows
+# only the loaded plugins' skills; classify() would treat any other Skill route as level 3.
+CHAT_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "Skill")
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -127,13 +130,19 @@ def _python_paths() -> list[Path]:
     return [Path(p) for p in raw if p]
 
 
+STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json")
+
+
 def _workdir_problem(config: Config, workdir: Path, config_dir: Path) -> str | None:
-    """Reasons the assistant's working directory is unsafe to use.
+    """Reasons the assistant's working directory (the vault) is unsafe to use.
 
     The assistant may write inside the workdir (after approval). Nothing that runs
     code or that the agent trusts may live there: the package, the interpreter and
     its site-packages (.pth files run at startup), the Claude Code binary and
-    config, the state, the session status files (they can trigger phone calls).
+    config, the state, the session status files (they can trigger phone calls),
+    the enabled plugins and the broker runtime directory (its MCP config holds the
+    approval token). The vault may live inside the state directory (the default is
+    state_dir/vault) as long as it contains no other state entry.
     """
     if not os.path.isabs(sys.executable or ""):
         return "the Python interpreter path is not absolute"
@@ -145,13 +154,35 @@ def _workdir_problem(config: Config, workdir: Path, config_dir: Path) -> str | N
         return "workdir must not be / or the home directory"
     if _inside(root, config.status_dir.resolve()):
         return "workdir must not be inside the session status directory"
+    state = config.state_dir.resolve()
+    from .plugins import core_checkout_root, core_plugin_dir
+
+    core = core_plugin_dir(config)
+    checkout = core_checkout_root(config)
+    inside_checks = [
+        ("the broker runtime directory", state / "run"),
+        ("the plugins directory", state / "plugins"),
+        ("the Claude Code config directory", config_dir.resolve()),
+    ]
+    if core is not None:
+        inside_checks.append(("the core plugin directory", core.resolve()))
+    if checkout is not None:
+        inside_checks.append(("the source checkout of the core plugin", checkout.resolve()))
+    for name, path in inside_checks:
+        if _inside(root, path):
+            return f"vault must not be inside {name}"
     claude_bin = shutil.which(config.claude_bin)
     checks: list[tuple[str, Path]] = [
         ("the Claude Code config directory", config_dir),
         ("the state directory", config.state_dir),
         ("the session status directory", config.status_dir),
         ("the system temp directory", Path(tempfile.gettempdir())),
+        ("the broker runtime directory", config.state_dir / "run"),
+        ("the plugins directory", config.state_dir / "plugins"),
     ]
+    checks += [(f"the state file {name}", config.state_dir / name) for name in STATE_ENTRIES]
+    if core is not None:
+        checks.append(("the core plugin directory", core))
     checks += [("the Python interpreter or its packages", p) for p in _python_paths()]
     if claude_bin:
         checks.append(("the Claude Code binary", Path(claude_bin)))
@@ -162,13 +193,137 @@ def _workdir_problem(config: Config, workdir: Path, config_dir: Path) -> str | N
     return None
 
 
+def _cmd_vault(config: Config, args: argparse.Namespace) -> int:
+    """Create the vault skeleton (never overwriting a file) or print its path."""
+    from .vault import Vault, VaultError
+
+    path = config.vault_path
+    if args.vault_command == "path":
+        print(path)
+        return 0
+    _, config_dir = config.bridge_paths()
+    problem = _workdir_problem(config, path, config_dir)
+    if problem:
+        print(f"[error] {problem}", file=sys.stderr)
+        return 2
+    try:
+        result = Vault(path, config.language).init()
+    except VaultError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    print(f"vault {path}")
+    for name in result.created:
+        print(f"created {clean_text(name, 80)}")
+    for name in result.kept:
+        print(f"kept {clean_text(name, 80)}")
+    for name in result.skipped:
+        print(f"skipped {clean_text(name, 80)} (symlink or not a regular file)")
+    return 0
+
+
+def _print_findings(report: object) -> None:
+    from .plugins import shown
+
+    for finding in report.findings:  # type: ignore[attr-defined]
+        where = shown(finding.path) + (f":{finding.line}" if finding.line else "")
+        print(f"{finding.severity:7}  {where}  {finding.rule}: {finding.message}")
+
+
+def _print_components(report: object) -> None:
+    for component in report.components:  # type: ignore[attr-defined]
+        description = json.dumps(component.description, ensure_ascii=True)
+        print(f"  {component.kind:7}  /{report.name}:{component.name}  {description}")  # type: ignore[attr-defined]
+
+
+def _confirm(question: str) -> bool:
+    try:
+        if not sys.stdin.isatty():
+            return False
+        return input(question).strip().lower() in ("y", "yes", "j", "ja")
+    except (EOFError, OSError, ValueError):
+        return False
+
+
+def _cmd_plugins(config: Config, args: argparse.Namespace) -> int:
+    """List, check, enable or disable plugins (standard Claude Code plugin folders)."""
+    from .plugins import PluginError, check_plugin, disable_plugin, enable_plugin, list_plugins, shown
+
+    command = args.plugins_command
+    if command == "list":
+        plugins = list_plugins(config)
+        if not plugins:
+            print("no plugins (core plugin not found: set PA_CORE_PLUGIN_DIR)")
+        for plugin in plugins:
+            digest = (plugin.report.digest or "-")[:12]
+            mark = " (shipped)" if plugin.shipped else ""
+            print(f"{shown(plugin.name)}{mark}  {shown(plugin.version or '-')}  {plugin.status}  {digest}  "
+                  f"{shown(plugin.path)}")
+        return 0
+    if command == "disable":
+        try:
+            disable_plugin(config, args.name)
+        except PluginError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+        print(f"disabled {shown(args.name)}; restart chat to unload it")
+        return 0
+
+    source = Path(args.dir).expanduser()
+    if not os.path.lexists(source):
+        print(f"[error] not found: {shown(source)}", file=sys.stderr)
+        return 2
+    report = check_plugin(source)
+    if command == "check":
+        _print_findings(report)
+        errors = sum(f.severity == "error" for f in report.findings)
+        warnings = len(report.findings) - errors
+        name = shown(report.name or "?")
+        verdict = "ok" if report.ok else "refused"
+        print(f"{verdict}: {name} {shown(report.version or '-')}, {report.files} files, {report.total_bytes} bytes, "
+              f"{len(report.components)} skills/commands/agents, {errors} errors, {warnings} warnings")
+        if report.ok:
+            _print_components(report)
+        return 0 if report.ok else 1
+
+    # enable
+    if not report.ok:
+        _print_findings(report)
+        print("[error] plugin check failed: not enabled", file=sys.stderr)
+        return 1
+    _print_findings(report)  # warnings only
+    print(f"plugin {shown(report.name)} {shown(report.version or '-')} adds:")
+    _print_components(report)
+    print("Skill descriptions are part of every request to the assistant.")
+    if not args.yes and not _confirm("Enable this plugin? [y/N] "):
+        print("[not enabled] (confirm in a terminal or pass --yes)", file=sys.stderr)
+        return 1
+    try:
+        installed = enable_plugin(config, source, replace=args.replace, expected_digest=report.digest)
+    except PluginError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    print(f"enabled {shown(installed.name)} {shown(installed.version or '-')}; restart chat to load it")
+    return 0
+
+
+def _cmd_brief(config: Config, args: argparse.Namespace) -> int:
+    """Build today's brief without a model, write it to the vault, optionally polish and send it."""
+    from .brief import run_brief
+
+    return run_brief(config, send=args.send, polish=args.polish, by="manual",
+                     out=None if args.quiet else print)
+
+
 def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
     """Talk to the assistant in the terminal. Writing asks for your approval first."""
     from .approval import PERMISSION_TOOL, ApprovalBroker, ConsoleChannel
+    from .approval_server import SERVER_NAME
     from .bridge import DEFAULT_TURN_TIMEOUT_S, BridgeConfig, BridgeError, ClaudeSession
+    from .plugins import invocable, load_for_session
     from .quota import QuotaGuard
     from .remote import RemoteChannel, local_opener
     from .router import Router, RouterConfig
+    from .vault import VAULT_SYSTEM_PROMPT, Vault, VaultError
 
     remote = bool(getattr(args, "remote_approvals", False))
     if remote and not config.api_token:
@@ -180,9 +335,25 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
         print(f"[error] {problem}", file=sys.stderr)
         return 2
     root = workdir.resolve()
+    vault = Vault(workdir, config.language)
+    try:
+        created = vault.init().created
+    except VaultError as exc:
+        print(f"[warning] {exc}", file=sys.stderr)
+        created = ()
+    if created:
+        print(f"[vault: created {', '.join(created)}]")
+    plugins, warnings = load_for_session(config)  # checked on every start
+    for warning in warnings:
+        print(f"[{warning}]")
+    plugin_names = tuple(p.name for p in plugins)
+    allowed_skills = invocable(plugins)
+    if plugins:
+        print(f"[plugins: {', '.join(plugin_names)}]")
 
     console_lock = threading.Lock()
     broker = ApprovalBroker(workdir, config.approval_timeout_s)
+    broker.allowed_skills = frozenset(allowed_skills)
     def stop() -> bool:
         return broker.closing.is_set() or not broker.turn_active.is_set()
 
@@ -208,6 +379,14 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
         broker.close()
         print("[error] the approval runtime directory must not be inside the workdir", file=sys.stderr)
         return 2
+    try:
+        # Outside the vault and 0600. Auto-loading of the vault's CLAUDE.md under
+        # --restricted is not verified, so the layout rules travel this way.
+        system_prompt = broker.write_runtime_file("vault-system-prompt.md", VAULT_SYSTEM_PROMPT)
+    except OSError as exc:
+        broker.close()
+        print(f"[error] could not write the system prompt: {type(exc).__name__}", file=sys.stderr)
+        return 1
 
     main_session = ClaudeSession(
         BridgeConfig(
@@ -218,12 +397,17 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
             tools=CHAT_TOOLS,
             mcp_config=mcp_path,
             permission_tool=PERMISSION_TOOL,
+            system_prompt_file=system_prompt,
+            plugin_dirs=tuple(p.path for p in plugins),
+            expected_plugins=plugin_names,
+            expected_mcp=(SERVER_NAME,),
+            allowed_skills=allowed_skills,
             oauth_token=config.claude_oauth_token,
         ),
         extra_env={"MCP_TOOL_TIMEOUT": str((config.approval_timeout_s + 30) * 1000)},
         turn_timeout_s=max(DEFAULT_TURN_TIMEOUT_S, config.approval_timeout_s + 120),
     )
-    # Tier 2: no tools at all, no MCP servers, no permission tool. Starts on first use.
+    # Tier 2: no tools at all, no MCP servers, no permission tool, no plugins. Starts on first use.
     small_session = None
     if config.router_small_model:
         small_session = ClaudeSession(
@@ -242,6 +426,10 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
         QuotaGuard(config.quota_stop, config.state_dir / "quota.json"),
         RouterConfig(config.router_small_model, config.router_small_max_chars),
         statuses=lambda: read_statuses(config.status_dir, config.status_max_age_min),
+        vault=vault,
+        context_chars=config.vault_context_chars,
+        slash_commands=frozenset("/" + name for name in allowed_skills),
+        on_context=broker.set_turn_context,
     )
 
     def say(line: str) -> None:
@@ -263,7 +451,7 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
                         console_lock.release()
 
     where = "on your phone" if remote else "here"
-    say(f"[workdir {workdir} · writing asks first ({where}) · help for commands · /exit to quit]")
+    say(f"[vault {workdir} · writing asks first ({where}) · help for commands · /exit to quit]")
     try:
         while True:
             try:
@@ -288,8 +476,10 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
                 say(f"[error] {error}")
                 continue
             if reply.refused:
-                say(f"[quota] {reply.text}")
+                say(f"[{'safety' if reply.safety else 'quota'}] {reply.text}")
                 continue
+            if reply.context_count:
+                say(f"[context: {reply.context_count} notes]")
             say(f"agent[{reply.tier}]> {reply.text}")
             result = reply.result
             if result is None:
@@ -340,6 +530,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ask for approvals through a Discord notice and a one-time link (needs `serve` running)",
     )
+
+    vault = sub.add_parser("vault", help="the Markdown vault the assistant works in")
+    vault_sub = vault.add_subparsers(dest="vault_command", required=True)
+    vault_sub.add_parser("init", help="create the vault skeleton (existing files are kept)")
+    vault_sub.add_parser("path", help="print the vault path")
+
+    plugins = sub.add_parser("plugins", help="checked Claude Code plugins (skills, commands, agents)")
+    plugins_sub = plugins.add_subparsers(dest="plugins_command", required=True)
+    plugins_sub.add_parser("list", help="list the core plugin and the enabled plugins")
+    check = plugins_sub.add_parser("check", help="check a plugin folder without enabling it")
+    check.add_argument("dir")
+    enable = plugins_sub.add_parser("enable", help="check a plugin folder and copy it into the state directory")
+    enable.add_argument("dir")
+    enable.add_argument("--replace", action="store_true", help="replace an enabled plugin of the same name")
+    enable.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    disable = plugins_sub.add_parser("disable", help="remove an enabled plugin")
+    disable.add_argument("name")
+
+    brief = sub.add_parser("brief", help="build today's brief (no model) and write it to the vault")
+    brief.add_argument("--send", action="store_true", help="post it to PA_DISCORD_WEBHOOK")
+    brief.add_argument("--polish", action="store_true",
+                       help="let the small model rewrite the text once per day (respects the quota guard)")
+    brief.add_argument("--quiet", action="store_true", help="do not print the brief")
     return parser
 
 
@@ -349,6 +562,9 @@ COMMANDS = {
     "status": _cmd_status,
     "simulate": _cmd_simulate,
     "chat": _cmd_chat,
+    "vault": _cmd_vault,
+    "plugins": _cmd_plugins,
+    "brief": _cmd_brief,
 }
 
 

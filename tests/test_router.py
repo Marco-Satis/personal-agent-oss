@@ -438,7 +438,7 @@ def test_chat_small_model_can_be_disabled(chat, capsys, monkeypatch):
     assert chat.run(["What is 2+2?", "/exit"]) == 0
     assert "agent[3]> echo: What is 2+2?" in capsys.readouterr().out
     args = chat.starts()[0]["args"]
-    assert args[args.index("--tools") + 1] == "Read,Glob,Grep,Write,Edit"
+    assert args[args.index("--tools") + 1] == "Read,Glob,Grep,Write,Edit,Skill"
 
 
 def test_chat_refuses_over_quota_without_starting(chat, capsys):
@@ -504,3 +504,413 @@ def test_router_config_errors(monkeypatch, tmp_path, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ConfigError):
         Config.from_env()
+
+
+# --- vault: note capture, slash commands, excerpts ------------------------------------
+
+
+from datetime import datetime  # noqa: E402
+
+from personal_agent import approval  # noqa: E402
+from personal_agent import router as router_mod  # noqa: E402
+from personal_agent.router import prefix_command, slash_problem  # noqa: E402
+from personal_agent.vault import Vault  # noqa: E402
+
+
+@pytest.fixture
+def vault(tmp_path):
+    v = Vault(tmp_path / "vault")
+    v.init()
+    return v
+
+
+def vault_router(vault, main=None, small=None, context_chars=3000, slash=(), **kw):
+    main = main or StubSession("main")
+    return Router(main, small, guard_with(None), CFG, statuses=lambda: [], vault=vault,
+                  context_chars=context_chars, slash_commands=frozenset(slash), **kw)
+
+
+def test_note_is_captured_at_tier1_without_a_model(vault):
+    main, small = StubSession("main"), StubSession("small")
+    router = vault_router(vault, main, small)
+    reply = router.handle("note buy milk")
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert reply.tier == 1 and not reply.is_error and reply.text == f"noted in raw/inbox-{today}.md"
+    assert router.handle("Notiz Brot kaufen").tier == 1
+    assert router.handle("/note third").tier == 1
+    lines = (vault.root / "raw" / f"inbox-{today}.md").read_text().splitlines()
+    assert lines[0] == f"# Inbox {today}" and lines[1] == ""
+    assert [line[8:] for line in lines[2:]] == ["buy milk", "Brot kaufen", "third"]
+    assert lines[2][:2] == "- " and lines[2][4] == ":"
+    assert main.sent == [] and small.sent == []
+
+
+def test_note_usage_errors_and_force_prefix(vault):
+    main = StubSession("main")
+    router = vault_router(vault, main, context_chars=0)
+    assert router.handle("note").text == "usage: note <text>"
+    assert router.handle("NOTE  ").text == "usage: note <text>"
+    long = router.handle("note " + "x" * 2001)
+    assert long.is_error and "2000" in long.text
+    multi = router.handle("note line one\nline\x07 two")
+    assert not multi.is_error
+    assert router.handle("!note x").tier == 3 and main.sent == ["note x"]
+    assert prefix_command("notes are fine") is None and prefix_command("!note x") is None
+
+
+def test_note_without_vault():
+    reply = make_router().handle("note x")
+    assert reply.tier == 1 and reply.is_error and reply.text == "no vault configured"
+
+
+def test_note_needs_no_quota(vault):
+    main = StubSession("main")
+    router = Router(main, None, guard_with(info(five=0.99)), CFG, statuses=lambda: [], vault=vault)
+    assert not router.handle("note offline idea").is_error
+    assert router.handle("hello").refused
+
+
+@pytest.mark.parametrize("text", [
+    "/config", "/unknown:x", "!/config", "! /clear", "​/config", "/core", "/core:nonexistent",
+    "!⁦ /compact", " \n/clear", "/core:daily-plan-x", "/CORE:daily-plan",
+])
+def test_slash_commands_are_refused_without_a_session(vault, text):
+    main, small = StubSession("main"), StubSession("small")
+    reply = vault_router(vault, main, small, slash=["/core:daily-plan"]).handle(text)
+    assert reply.tier == 1 and reply.is_error and "unknown command" in reply.text
+    assert main.sent == [] and small.sent == []
+
+
+def test_allowed_plugin_command_goes_verbatim_to_tier3(vault):
+    (vault.root / "wiki" / "daily.md").write_text("daily plan notes")
+    main, small = StubSession("main"), StubSession("small")
+    router = vault_router(vault, main, small, slash=["/core:daily-plan"])
+    reply = router.handle("/core:daily-plan today please")
+    assert reply.tier == 3 and reply.context_count == 0
+    assert main.sent == ["/core:daily-plan today please"] and small.sent == []
+    assert router.handle("!​/core:daily-plan").tier == 3
+    assert main.sent[-1] == "/core:daily-plan"
+
+
+def test_plugin_command_marks_the_approval_context(vault):
+    main = StubSession("main")
+    seen = []
+    router = vault_router(vault, main, slash=["/core:organize-inbox"], on_context=seen.append)
+    assert router.handle("/core:organize-inbox").tier == 3
+    # The CLI expands the command itself (no Skill tool call), so the router marks the turn.
+    assert seen == [router_mod.SKILL_MARKER]
+    assert router_mod.SKILL_MARKER == approval.SKILL_CONTEXT
+    seen.clear()
+    router.handle("/config")  # refused: nothing sent, nothing marked
+    assert seen == []
+
+
+def test_plugin_command_marker_reaches_a_write_approval(vault):
+    seen = []
+
+    class Channel:
+        def ask(self, request, deadline):
+            seen.append(request)
+            return True
+
+    class SkillSession(StubSession):
+        """Like the CLI expanding /core:organize-inbox: the skill asks for one Write."""
+
+        def send(self, text, on_event=None):
+            result = super().send(text, on_event)
+            tool_input = {"file_path": "wiki/garden.md", "content": "x"}
+            broker.observe({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Write", "input": tool_input}]}})
+            assert broker.decide("Write", tool_input, "toolu_1").allow
+            return result
+
+    broker = approval.ApprovalBroker(vault.root, channel=Channel(), bind_wait_s=0.2)
+    router = vault_router(vault, SkillSession("main"), slash=["/core:organize-inbox"],
+                          on_context=broker.set_turn_context)
+    broker.begin_turn()
+    assert router.handle("/core:organize-inbox").tier == 3
+    assert seen[-1].context == approval.SKILL_CONTEXT
+
+
+def test_slash_problem_helper():
+    allowed = frozenset({"/core:capture-note"})
+    assert slash_problem("hello /config", allowed) is None
+    assert slash_problem("/core:capture-note buy milk", allowed) is None
+    assert slash_problem("﻿/core:capture-note", allowed) is None
+    assert slash_problem("/core:capture-note​ x", allowed)  # invisible inside the word
+    assert slash_problem("\U000e0020/help", allowed)
+
+
+def test_tier3_gets_delimited_excerpts_tier2_never(vault):
+    (vault.root / "wiki" / "boiler.md").write_text("# Boiler\n\nThe boiler service is due in November.")
+    main, small = StubSession("main"), StubSession("small")
+    seen = []
+    router = vault_router(vault, main, small, on_context=seen.append)
+    reply = router.handle("remind me about the boiler service")
+    assert reply.tier == 3 and reply.context_count >= 1
+    sent = main.sent[-1]
+    assert sent.startswith('<vault-excerpts id="') and 'path="wiki/boiler.md"' in sent
+    assert sent.endswith("<user-message>\nremind me about the boiler service\n</user-message>")
+    assert seen == [router_mod.CONTEXT_MARKER]
+    assert router.handle("When is the boiler service due?").tier == 2
+    assert small.sent == ["When is the boiler service due?"]
+    forced = router.handle("!boiler")
+    assert forced.tier == 3 and main.sent[-1].startswith("<vault-excerpts")
+    unrelated = router.handle("hello there")
+    assert unrelated.context_count == 0 and main.sent[-1] == "hello there"
+
+
+def test_context_chars_zero_sends_plain_text(vault):
+    (vault.root / "wiki" / "boiler.md").write_text("boiler service")
+    main = StubSession("main")
+    reply = vault_router(vault, main, context_chars=0).handle("boiler service plans")
+    assert reply.context_count == 0 and main.sent == ["boiler service plans"]
+
+
+def test_too_long_prompt_drops_excerpts(vault):
+    (vault.root / "wiki" / "boiler.md").write_text("boiler " + "z" * 1000)
+    main = StubSession("main")
+    message = "boiler " + "w " * 9_900
+    reply = vault_router(vault, main, context_chars=12_000).handle(message)
+    assert reply.context_count == 0 and main.sent == [message.strip()]
+
+
+def test_broken_vault_selection_keeps_the_turn(vault, monkeypatch):
+    def boom(*args, **kw):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(vault, "select_context", boom)
+    main = StubSession("main")
+    reply = vault_router(vault, main).handle("boiler service plans")
+    assert reply.tier == 3 and main.sent == ["boiler service plans"]
+
+
+def test_help_mentions_note(vault):
+    text = vault_router(vault, slash=["/core:daily-plan"]).handle("help").text
+    assert "note <text>" in text and "/core:daily-plan" in text
+    assert "note <text>" not in make_router().handle("help").text
+
+
+# --- safety tripwires (plugins, hooks, MCP servers, skills) ------------------------------
+
+from personal_agent.bridge import BridgeConfig  # noqa: E402
+from personal_agent.router import (  # noqa: E402
+    PaidUsageStop,
+    SafetyStop,
+    UnsafeInput,
+    guarded_send,
+    init_problem,
+)
+
+
+def plugin_config(tmp_path, **kw):
+    core = tmp_path / "core"
+    core.mkdir(exist_ok=True)
+    values = dict(workdir=tmp_path, config_dir=tmp_path, tools=("Read", "Skill"), permission_tool="mcp__pa__approve",
+                  plugin_dirs=(core,), expected_plugins=("core",), expected_mcp=("pa",),
+                  allowed_skills=("core:daily-plan",))
+    values.update(kw)
+    return BridgeConfig(**values)
+
+
+def good_init(config, **extra):
+    event = {"type": "system", "subtype": "init", "apiKeySource": "none", "tools": ["Read", "Skill"],  # pragma: allowlist secret
+             "mcp_servers": [{"name": "pa", "status": "connected"}],
+             "plugins": [{"name": "core", "path": str(config.plugin_dirs[0]), "source": "core@inline"},
+                         {"name": "cc-plugin-telemetry", "path": "builtin", "source": "cc-plugin-telemetry@builtin"}],
+             "skills": ["core:daily-plan", "dataviz", "cc-plugin-telemetry:x"]}
+    event.update(extra)
+    return event
+
+
+class ConfiguredStub(StubSession):
+    def __init__(self, name, config, events=()):
+        super().__init__(name, events)
+        self.config = config
+
+
+def test_builtin_plugins_and_expected_init_pass(tmp_path):
+    config = plugin_config(tmp_path)
+    assert init_problem(good_init(config), config) is None
+    main = ConfiguredStub("main", config, [good_init(config)])
+    assert not make_router(main).handle("hello").refused
+
+
+@pytest.mark.parametrize("change, expected", [
+    ({"tools": ["Read", "Skill", "mcp__x__y"]}, "unexpected tool"),
+    ({"tools": "Read"}, "does not list the tools"),
+    ({"mcp_servers": [{"name": "pa"}, {"name": "claude.ai Mail"}]}, "unexpected MCP server"),
+    ({"mcp_servers": ["pa"]}, "MCP server without a name"),
+    ({"plugins": [{"name": "evil", "path": "/tmp/evil", "source": "evil@inline"}]}, "unexpected plugin"),
+    ({"plugins": [{"name": "core", "path": "/elsewhere", "source": "core@inline"}]}, "unexpected path"),
+    ({"plugins": [{"name": "core"}]}, "without a name or source"),
+    ({"plugins": None}, "does not list the plugins"),
+    ({"skills": ["evil:steal"]}, "unexpected plugin"),
+])
+def test_init_tripwire_cases(tmp_path, change, expected):
+    config = plugin_config(tmp_path)
+    event = good_init(config, **change)
+    if change.get("plugins", 0) is None:
+        del event["plugins"]
+    assert expected in init_problem(event, config)
+
+
+def test_small_session_must_list_no_tools(tmp_path):
+    small = BridgeConfig(workdir=tmp_path, config_dir=tmp_path, tools=())
+    assert init_problem({"type": "system", "subtype": "init"}, small) is None  # lists missing: not strict
+    assert "unexpected tool" in init_problem({"tools": ["Read"]}, small)
+    assert "unexpected plugin" in init_problem(
+        {"plugins": [{"name": "core", "path": "/x", "source": "core@inline"}]}, small)
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"},
+    {"type": "system", "subtype": "hook_response"},
+    {"type": "system", "subtype": "hook_progress"},
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Skill", "input": {"skill": "update-config"}}]}},
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Skill", "input": {}}]}},
+])
+def test_safety_stop_closes_session_and_halts(tmp_path, event):
+    config = plugin_config(tmp_path)
+    main = ConfiguredStub("main", config, [good_init(config), event])
+    router = make_router(main)
+    reply = router.handle("hello")
+    assert reply.refused and reply.safety and reply.is_error and reply.text.startswith("Stopped:")
+    assert main.closed == [0]
+    later = router.handle("hello again")
+    assert later.refused and later.safety and "Restart the chat" in later.text
+    assert main.sent == ["hello"]
+
+
+def test_allowed_skill_call_passes(tmp_path):
+    config = plugin_config(tmp_path)
+    call = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Skill", "input": {"skill": "core:daily-plan"}}]}}
+    main = ConfiguredStub("main", config, [good_init(config), call])
+    assert not make_router(main).handle("plan my day").refused
+
+
+def test_paid_usage_stop_is_a_safety_stop_but_does_not_halt():
+    assert issubclass(PaidUsageStop, SafetyStop) and issubclass(UnsafeInput, SafetyStop)
+    event = {"type": "rate_limit_event", "rate_limit_info": info(five=0.5, isUsingOverage=True, resetsAt=NOW + 3600)}
+    router = make_router(StubSession("main", [event]))
+    reply = router.handle("hello")
+    assert reply.refused and not reply.safety and router.halted is None
+
+
+def test_guarded_send_refuses_slash_before_starting(tmp_path):
+    config = plugin_config(tmp_path)
+    main = ConfiguredStub("main", config)
+    for body in ("!/config", "/config", "​/clear", "/core", "/core:nonexistent", " /compact"):
+        with pytest.raises(UnsafeInput):
+            guarded_send(main, body, guard_with(None))
+    guarded_send(main, "/core:daily-plan now", guard_with(None))
+    assert main.sent == ["/core:daily-plan now"]
+
+
+@pytest.mark.parametrize("text", ["!/config", "! /clear", "​/config", "/core", "/core:nonexistent"])
+def test_router_refuses_slash_bypasses_at_tier1(tmp_path, text):
+    config = plugin_config(tmp_path)
+    main = ConfiguredStub("main", config)
+    router = Router(main, None, guard_with(None), CFG, statuses=lambda: [],
+                    slash_commands=frozenset({"/core:daily-plan"}))
+    reply = router.handle(text)
+    assert reply.tier == 1 and reply.is_error and main.sent == []
+
+
+# --- end to end with the fake CLI and an enabled plugin -------------------------------------
+
+
+def make_demo_plugin(root):
+    files = {
+        ".claude-plugin/plugin.json": '{"name": "demo", "version": "1.0.0"}',
+        "skills/hello/SKILL.md": "---\nname: hello\ndescription: Greets back.\n---\nSay hello.\n",
+    }
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return root
+
+
+@pytest.fixture
+def plugin_chat(chat, tmp_path, monkeypatch):
+    from personal_agent.config import Config as _Config
+    from personal_agent.plugins import enable_plugin
+
+    monkeypatch.setenv("PA_CORE_PLUGIN_DIR", "off")
+    monkeypatch.delenv("FAKE_CLAUDE_EXTRA_INIT", raising=False)
+    enable_plugin(_Config.from_env(), make_demo_plugin(tmp_path / "demo-src"))
+    return chat
+
+
+def test_chat_loads_enabled_plugin(plugin_chat, capsys, monkeypatch):
+    monkeypatch.setattr("personal_agent.approval.stdin_is_tty", lambda: True)
+    assert plugin_chat.run(["/demo:hello", "SKILL demo:hello", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "[plugins: demo]" in out
+    assert "agent[3]> echo: /demo:hello" in out
+    assert "agent[3]> skill demo:hello loaded" in out and "[approval]" not in out
+    args = plugin_chat.starts()[0]["args"]
+    assert args[args.index("--plugin-dir") + 1] == str(plugin_chat.state / "plugins" / "demo")
+    assert "Skill" in args[args.index("--tools") + 1].split(",")
+
+
+def test_chat_stops_on_builtin_skill_call(plugin_chat, capsys):
+    assert plugin_chat.run(["SKILL update-config", "hello", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "[safety] Stopped: the assistant tried to load a skill that is not allowed" in out
+    assert "[safety] Not sent: the assistant was stopped earlier" in out
+
+
+def test_chat_stops_on_hook_event(plugin_chat, capsys):
+    assert plugin_chat.run(["HOOK", "/exit"]) == 0
+    assert "[safety] Stopped: a hook ran inside the assistant session" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra, message", [
+    ('{"mcp_servers": [{"name": "pa"}, {"name": "intruder"}]}', "unexpected MCP server"),
+    ('{"plugins": [{"name": "evil", "path": "/x", "source": "evil@inline"}]}', "unexpected plugin"),
+    ('{"tools": ["Read", "mcp__x__y"]}', "unexpected tool"),
+])
+def test_chat_stops_on_unexpected_init(plugin_chat, capsys, extra, message):
+    plugin_chat.make_wrapper(f"FAKE_CLAUDE_EXTRA_INIT={shlex.quote(extra)} ")
+    assert plugin_chat.run(["hello", "/exit"]) == 0
+    assert message in capsys.readouterr().out
+
+
+REPO_CORE = FAKE.resolve().parents[1] / "plugins" / "core"
+
+
+def test_chat_loads_the_shipped_core_plugin(chat, capsys, monkeypatch):
+    monkeypatch.delenv("PA_CORE_PLUGIN_DIR", raising=False)
+    monkeypatch.delenv("FAKE_CLAUDE_EXTRA_INIT", raising=False)
+    monkeypatch.setattr("personal_agent.approval.stdin_is_tty", lambda: True)
+    assert chat.run(["/core:daily-plan", "SKILL core:organize-inbox", "/core:nope", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "[plugins: core]" in out and "core plugin not found" not in out
+    assert "agent[3]> echo: /core:daily-plan" in out  # verbatim, so the CLI expands the skill
+    assert "agent[3]> skill core:organize-inbox loaded" in out and "[approval]" not in out
+    assert "unknown command" in out and "[safety]" not in out
+    starts = chat.starts()
+    assert len(starts) == 1
+    args = starts[0]["args"]
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--plugin-dir"] == [str(REPO_CORE)]
+    assert "Skill" in args[args.index("--tools") + 1].split(",")
+
+
+def test_chat_core_off_loads_no_plugin(chat, capsys, monkeypatch):
+    monkeypatch.setenv("PA_CORE_PLUGIN_DIR", "off")
+    assert chat.run(["hello", "/core:daily-plan", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "[plugins:" not in out and "unknown command" in out
+    assert "--plugin-dir" not in chat.starts()[0]["args"]
+
+
+def test_chat_slash_bypass_is_refused_without_a_process(plugin_chat, capsys):
+    assert plugin_chat.run(["!/config", "/demo", "/demo:nope", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("unknown command") == 3
+    assert plugin_chat.starts() == []

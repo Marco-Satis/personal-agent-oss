@@ -74,6 +74,9 @@ MAX_SOCKET_PATH = 100      # AF_UNIX allows 108 bytes
 POLL_S = 0.5
 CLOSE_JOIN_S = 3.0         # close() waits this long for running decisions to clean up
 YES = ("y", "yes", "j", "ja")
+SKILL_TOOL = "Skill"
+SKILL_CONTEXT = "plugin skill in this turn"
+CONTEXT_HINT = "this request may come from note text or a plugin skill"
 
 
 class Level(IntEnum):
@@ -297,6 +300,7 @@ class ApprovalRequest:
     summary: str            # render_input(...)
     tool_use_id: str | None
     full: str | None = None  # complete input, set for level 3 when the summary is cut
+    context: str | None = None  # e.g. "note context in this turn": the request may stem from note text
     request_id: str = field(default_factory=lambda: secrets.token_urlsafe(8))  # log reference only
 
 
@@ -407,6 +411,8 @@ class ConsoleChannel:
             self.write("[could not clear typed-ahead input: denied]")
             return False
         self.write(f"[approval] level {int(request.level)} ({LEVEL_LABELS[request.level]}): {request.tool_name}")
+        if request.context:
+            self.write(f"  ({request.context}: {CONTEXT_HINT})")
         self.write(f"  {request.summary}")
         if request.full is not None:
             self.write("  complete input:")
@@ -570,6 +576,7 @@ class ApprovalBroker:
         self.channel = channel  # replaceable at runtime
         self.clock = clock
         self.bind_wait_s = bind_wait_s
+        self.allowed_skills: frozenset[str] = frozenset()  # "<plugin>:<name>" of loaded plugins
         self.token: str | None = None
         self.turn_active = threading.Event()
         self.closing = threading.Event()
@@ -583,6 +590,8 @@ class ApprovalBroker:
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
         self._dir: Path | None = None
+        self._runtime_files: list[str] = []
+        self._turn_context: str | None = None
 
     # --- turn bookkeeping, called by the chat loop ---
 
@@ -591,6 +600,7 @@ class ApprovalBroker:
             self._tool_uses.clear()
             self._used.clear()
             self._refusals = 0
+            self._turn_context = None
             self.turn_active.set()
             self._cond.notify_all()
 
@@ -599,6 +609,15 @@ class ApprovalBroker:
             self.turn_active.clear()
             self._tool_uses.clear()
             self._cond.notify_all()
+
+    def set_turn_context(self, note: str) -> None:
+        """Mark the active turn, e.g. because note excerpts were attached. Reset by begin_turn."""
+        note = clean_text(note, 60)
+        with self._cond:
+            current = self._turn_context
+            if current and note and note not in current:
+                note = f"{current}; {note}"
+            self._turn_context = clean_text(note, 120) or current
 
     def observe(self, event: object) -> None:
         """Remember the tool calls the assistant announces in the stream (assistant events)."""
@@ -721,6 +740,16 @@ class ApprovalBroker:
         reason = path_problem(tool_name, announced, self.workdir)
         if reason:
             return Verdict(False, reason), None, rid
+        if tool_name == SKILL_TOOL:
+            # The bridge routes every Skill call here (permissions "ask"). Only the
+            # skills of the checked, loaded plugins are allowed, without a prompt;
+            # built-in skills (update-config, schedule, ...) are denied without asking.
+            skill = announced.get("skill")
+            if isinstance(skill, str) and skill.lstrip("/") in self.allowed_skills:
+                self.set_turn_context(SKILL_CONTEXT)
+                return Verdict(True, "allowed plugin skill"), Level.READ, rid
+            return Verdict(False, "this skill is not allowed"), None, rid
+        # classify() itself stays fail-safe: any other route of Skill here is level 3.
         level = classify(tool_name, announced, self.workdir)
         if level is Level.READ:
             return Verdict(True, "read-only"), level, rid
@@ -734,6 +763,7 @@ class ApprovalBroker:
             summary=summary,
             tool_use_id=tool_use_id,
             full=render_full(announced) if level >= Level.DANGER and was_cut else None,
+            context=self._turn_context,
         )
         with self._cond:
             if self._refusals >= MAX_REFUSALS_PER_TURN:
@@ -816,6 +846,17 @@ class ApprovalBroker:
             raise
         return directory / "mcp.json"
 
+    def write_runtime_file(self, name: str, text: str) -> Path:
+        """Write a private (0600) file into the runtime directory; close() removes it."""
+        if self._dir is None:
+            raise RuntimeError("broker not started")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name) or name in ("s", "mcp.json"):
+            raise ValueError("invalid runtime file name")
+        path = self._dir / name
+        write_private(path, text)
+        self._runtime_files.append(name)
+        return path
+
     def close(self, join_s: float = CLOSE_JOIN_S) -> None:
         """Stop listening and remove the socket, the MCP config and the directory.
 
@@ -839,11 +880,12 @@ class ApprovalBroker:
             server.server_close()
         directory, self._dir = self._dir, None
         if directory is not None:
-            for name in ("s", "mcp.json"):
+            for name in ("s", "mcp.json", *self._runtime_files):
                 try:
                     (directory / name).unlink()
                 except OSError:
                     pass
+            self._runtime_files.clear()
             try:
                 directory.rmdir()
             except OSError:

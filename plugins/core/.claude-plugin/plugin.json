@@ -1,0 +1,6 @@
+{
+  "name": "core",
+  "version": "0.2.0",
+  "description": "Vault skills: organize captures into the wiki, plan the day, capture notes.",
+  "license": "Apache-2.0"
+}

@@ -816,11 +816,11 @@ def chat(tmp_path, monkeypatch, tty):
 def test_chat_write_is_approved(chat, capsys):
     assert chat.run(["WRITE a.txt", "/exit"], ["y"]) == 0
     out = capsys.readouterr().out
-    assert (chat.state / "workspace" / "a.txt").read_text() == "x"
+    assert (chat.state / "vault" / "a.txt").read_text() == "x"
     assert "[approval] level 2 (write): Write" in out and "agent[3]> wrote a.txt" in out
     entry = json.loads(chat.log.read_text().splitlines()[0])
     args = entry["args"]
-    assert args[args.index("--tools") + 1] == "Read,Glob,Grep,Write,Edit"
+    assert args[args.index("--tools") + 1] == "Read,Glob,Grep,Write,Edit,Skill"
     assert args[args.index("--permission-prompt-tool") + 1] == "mcp__pa__approve"
     assert "--restricted" in args and "--mcp-config" in args
     assert "MCP_TOOL_TIMEOUT" in entry["env"]
@@ -830,7 +830,7 @@ def test_chat_write_is_approved(chat, capsys):
 def test_chat_write_is_denied(chat, capsys):
     assert chat.run(["WRITE a.txt", "/exit"], ["n"]) == 0
     out = capsys.readouterr().out
-    assert not (chat.state / "workspace" / "a.txt").exists()
+    assert not (chat.state / "vault" / "a.txt").exists()
     assert "[not approved: Write]" in out and "[denied]" in out
 
 
@@ -897,7 +897,7 @@ def test_chat_error_while_a_prompt_is_open_ends_the_prompt(chat, monkeypatch, ca
     assert "[approval] level 2 (write): Write" in out  # the prompt really was open
     assert "[error]" in out and "[approved]" not in out
     assert elapsed < 10, elapsed  # not the 30 s approval timeout
-    assert not (chat.state / "workspace" / "a.txt").exists()
+    assert not (chat.state / "vault" / "a.txt").exists()
 
 
 # --- configuration -------------------------------------------------------------

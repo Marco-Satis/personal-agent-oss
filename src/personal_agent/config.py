@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import math
 import os
+import re
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +122,20 @@ def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipa
     return tuple(networks)
 
 
+_BRIEF_TIME = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+BRIEF_DISCORD_MODES = ("counts", "full")
+
+
+def _parse_brief_time(raw: str | None) -> tuple[int, int] | None:
+    """Parse "07:30" (or "7:30") into (7, 30). None or empty turns the morning brief off."""
+    if not raw:
+        return None
+    match = _BRIEF_TIME.fullmatch(raw)
+    if not match:
+        raise ConfigError("PA_BRIEF_TIME must look like 07:30")
+    return int(match[1]), int(match[2])
+
+
 def _optional_path(name: str) -> Path | None:
     raw = _env(name)
     return Path(raw).expanduser() if raw else None
@@ -158,7 +173,10 @@ class Config:
     twilio: TwilioConfig | None = field(default=None, repr=False)
     claude_bin: str = "claude"
     claude_model: str = "sonnet"
-    workdir: Path | None = None
+    vault_dir: Path | None = None
+    vault_context_chars: int = 3000
+    core_plugin: Path | None = None  # PA_CORE_PLUGIN_DIR; None means auto-discovery
+    core_plugin_off: bool = False    # PA_CORE_PLUGIN_DIR=off
     claude_config_dir: Path | None = None
     claude_oauth_token: str | None = field(default=None, repr=False)
     approval_timeout_s: int = 300
@@ -169,17 +187,25 @@ class Config:
     public_approval_url: str | None = None
     approval_pin: str | None = field(default=None, repr=False)
     trusted_clients: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+    brief_time: tuple[int, int] | None = None  # PA_BRIEF_TIME, local (hour, minute); None = off
+    brief_grace_min: int = 120
+    brief_polish: bool = False
+    brief_discord: str = "counts"  # "counts": only counts go to Discord; "full": the escaped text
 
     @property
     def remote_approvals(self) -> bool:
         """Whether `serve` offers approvals from the phone (notice plus one-time link)."""
         return bool(self.discord_webhook and self.public_approval_url)
 
+    @property
+    def vault_path(self) -> Path:
+        """The vault: the assistant's Markdown workspace (PA_VAULT_DIR or state_dir/vault)."""
+        return self.vault_dir or self.state_dir / "vault"
+
     def bridge_paths(self) -> tuple[Path, Path]:
-        """Working directory and Claude Code config directory for the assistant."""
-        workdir = self.workdir or self.state_dir / "workspace"
+        """Working directory (the vault) and Claude Code config directory for the assistant."""
         config_dir = self.claude_config_dir or self.state_dir / "claude-config"
-        return workdir, config_dir
+        return self.vault_path, config_dir
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -218,6 +244,22 @@ class Config:
         approval_pin = _env("PA_APPROVAL_PIN")
         if approval_pin is not None:
             validate_pin(approval_pin, "PA_APPROVAL_PIN")
+        vault_dir = _optional_path("PA_VAULT_DIR")
+        legacy_workdir = _optional_path("PA_WORKDIR")  # legacy alias of PA_VAULT_DIR
+        if vault_dir and legacy_workdir and vault_dir.resolve() != legacy_workdir.resolve():
+            raise ConfigError("set PA_VAULT_DIR or PA_WORKDIR, not both")
+        vault_context_chars = _env_int("PA_VAULT_CONTEXT_CHARS", 3000)
+        if not 0 <= vault_context_chars <= 12000:
+            raise ConfigError("PA_VAULT_CONTEXT_CHARS must be between 0 and 12000 (0 turns note excerpts off)")
+        core_raw = _env("PA_CORE_PLUGIN_DIR")
+        core_plugin_off = core_raw is not None and core_raw.lower() in ("off", "none", "0")
+        core_plugin = None if core_raw is None or core_plugin_off else Path(core_raw).expanduser()
+        brief_grace_min = _env_int("PA_BRIEF_GRACE_MIN", 120)
+        if not 1 <= brief_grace_min <= 720:
+            raise ConfigError("PA_BRIEF_GRACE_MIN must be between 1 and 720 minutes")
+        brief_discord = (_env("PA_BRIEF_DISCORD", "counts") or "counts").lower()
+        if brief_discord not in BRIEF_DISCORD_MODES:
+            raise ConfigError("PA_BRIEF_DISCORD must be 'counts' or 'full'")
 
         return cls(
             state_dir=state_dir,
@@ -238,7 +280,10 @@ class Config:
             twilio=twilio,
             claude_bin=_env("PA_CLAUDE_BIN", "claude") or "claude",
             claude_model=_env("PA_CLAUDE_MODEL", "sonnet") or "sonnet",
-            workdir=_optional_path("PA_WORKDIR"),
+            vault_dir=vault_dir or legacy_workdir,
+            vault_context_chars=vault_context_chars,
+            core_plugin=core_plugin,
+            core_plugin_off=core_plugin_off,
             claude_config_dir=_optional_path("PA_CLAUDE_CONFIG_DIR"),
             claude_oauth_token=_env("CLAUDE_CODE_OAUTH_TOKEN"),
             approval_timeout_s=approval_timeout_s,
@@ -249,6 +294,10 @@ class Config:
             public_approval_url=_parse_public_approval_url(_env("PA_PUBLIC_APPROVAL_URL")),
             approval_pin=approval_pin,
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),
+            brief_time=_parse_brief_time(_env("PA_BRIEF_TIME")),
+            brief_grace_min=brief_grace_min,
+            brief_polish=(_env("PA_BRIEF_POLISH", "") or "").lower() in ("1", "true", "yes"),
+            brief_discord=brief_discord,
         )
 
     def validate_for_serve(self) -> None:
@@ -260,8 +309,10 @@ class Config:
         validate_pin(self.call_pin)
         if self.provider == "twilio" and not (self.public_url or "").startswith("https://"):
             raise ConfigError("PA_PUBLIC_URL must be an https:// URL when using Twilio")
-        if bool(self.discord_webhook) != bool(self.public_approval_url):
-            raise ConfigError("set PA_DISCORD_WEBHOOK and PA_PUBLIC_APPROVAL_URL together, or neither")
+        if self.public_approval_url and not self.discord_webhook:
+            raise ConfigError("PA_PUBLIC_APPROVAL_URL needs PA_DISCORD_WEBHOOK")
+        if self.brief_time is not None and not self.discord_webhook:
+            raise ConfigError("PA_BRIEF_TIME needs PA_DISCORD_WEBHOOK")
         if self.remote_approvals:
             validate_pin(self.approval_pin, "PA_APPROVAL_PIN")
 

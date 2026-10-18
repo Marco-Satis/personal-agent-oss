@@ -810,11 +810,11 @@ def test_local_check_accepts_trusted_container_gateway():
 
 def test_validate_for_serve_remote_settings(tmp_path):
     base = server_config(tmp_path)  # public URL only
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="needs PA_DISCORD_WEBHOOK"):
         base.validate_for_serve()
     only_hook = Config(**{**base.__dict__, "public_approval_url": None, "discord_webhook": HOOK})
-    with pytest.raises(ConfigError):
-        only_hook.validate_for_serve()
+    only_hook.validate_for_serve()  # a webhook alone is fine (morning brief only)
+    assert not only_hook.remote_approvals
     no_pin = Config(**{**base.__dict__, "discord_webhook": HOOK})
     with pytest.raises(ConfigError):
         no_pin.validate_for_serve()
@@ -857,7 +857,7 @@ def test_chat_with_remote_approval(remote_chat, served, capsys):
     assert remote_chat.run(["WRITE a.txt", "/exit"]) == 0
     clicker.join(10)
     out = capsys.readouterr().out
-    assert (remote_chat.state / "workspace" / "a.txt").read_text() == "x"
+    assert (remote_chat.state / "vault" / "a.txt").read_text() == "x"
     assert "[approval pending remotely: Write (level 2), link sent]" in out
     assert "agent[3]> wrote a.txt" in out
     assert TOKEN not in out

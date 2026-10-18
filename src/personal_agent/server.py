@@ -17,6 +17,9 @@ and `/internal/` must never be forwarded. As defense in depth, both answer 404
 unless the client is on loopback (or in PA_TRUSTED_CLIENTS, e.g. a container's
 bridge gateway) and the request carries no forwarding header, because many
 tunnel tools forward the whole port when no path is given.
+
+With PA_BRIEF_TIME set, a separate thread sends the morning brief once per day
+(see brief.BriefScheduler).
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import Config
 from .conversation import Call, CallRegistry
@@ -37,6 +41,9 @@ from .approval import CONFIRM_WORD
 from .remote import ID_RE, TEXTS, ApprovalInbox, DiscordWebhook, render_message, render_page
 from .status import read_statuses
 from .telephony import CallProvider, FakeProvider, TwilioProvider, render_twiml, valid_twilio_signature
+
+if TYPE_CHECKING:
+    from .brief import BriefScheduler
 
 log = logging.getLogger(__name__)
 
@@ -438,6 +445,34 @@ def _watch_loop(agent: Agent, stop: threading.Event, interval_s: int = 60) -> No
             log.error("session watch failed: %s", type(exc).__name__)
 
 
+def _brief_loop(scheduler: "BriefScheduler", stop: threading.Event, interval_s: float = 30) -> None:
+    """Tick the morning brief scheduler until stop is set. A failed tick never ends the loop."""
+    while not stop.is_set():
+        try:
+            scheduler.tick()
+        except Exception as exc:  # noqa: BLE001 - log the type only, keep scheduling
+            log.error("morning brief tick failed: %s", type(exc).__name__)
+        if stop.wait(interval_s):
+            break
+
+
+def start_brief_thread(config: Config, stop: threading.Event) -> threading.Thread | None:
+    """Start the daily brief in its own thread (separate from the session watch), or None when off.
+
+    Local time comes from the process (TZ). The webhook is never logged.
+    """
+    if config.brief_time is None:
+        return None
+    from .brief import BriefScheduler
+
+    thread = threading.Thread(target=_brief_loop, args=(BriefScheduler(config), stop), daemon=True,
+                              name="morning-brief")
+    thread.start()
+    hour, minute = config.brief_time
+    log.info("morning brief daily at %02d:%02d (grace %d min)", hour, minute, config.brief_grace_min)
+    return thread
+
+
 def serve(config: Config) -> None:
     config.validate_for_serve()
     config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +488,7 @@ def serve(config: Config) -> None:
     stop = threading.Event()
     watcher = threading.Thread(target=_watch_loop, args=(agent, stop), daemon=True)
     watcher.start()
+    start_brief_thread(config, stop)
     log.info("listening on %s:%s (provider: %s)", config.bind_host, config.port, config.provider)
     try:
         server.serve_forever()

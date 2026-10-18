@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import __version__
-from .approval import CONFIRM_WORD, LEVEL_LABELS, ApprovalRequest, Level
+from .approval import CONFIRM_WORD, CONTEXT_HINT, LEVEL_LABELS, ApprovalRequest, Level
 from .status import clean_text
 
 log = logging.getLogger(__name__)
@@ -453,7 +453,9 @@ class RemoteChannel:
                 "POST",
                 "/internal/approvals",
                 {"tool_name": request.tool_name, "level": int(request.level),
-                 "summary": request.summary, "timeout_s": remaining},
+                 "summary": (f"({request.context}: {CONTEXT_HINT})\n"
+                             if request.context else "") + request.summary,
+                 "timeout_s": remaining},
                 # The server posts the notice before it answers. Wait as long as the entry
                 # can live: if this call gives up, the entry it may have created has expired.
                 timeout=remaining,

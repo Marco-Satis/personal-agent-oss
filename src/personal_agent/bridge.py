@@ -4,8 +4,10 @@ The process speaks stream-json on stdin and stdout. Claude Code runs locked down
 `--restricted` (no shell or code tools, file tools confined to the working
 directory), an explicit `--tools` allowlist (restricted mode alone still leaves
 tools such as SendMessage that could reach other sessions), only our own MCP
-servers (`--strict-mcp-config`), and a minimal environment without API keys so
-there is never a paid fallback when the subscription quota runs out.
+servers (`--strict-mcp-config`), hooks switched off and the Skill tool routed
+through the permission tool (`--settings`, see HARDENED_SETTINGS), and a
+minimal environment without API keys so there is never a paid fallback when the
+subscription quota runs out.
 """
 
 from __future__ import annotations
@@ -27,6 +29,16 @@ log = logging.getLogger(__name__)
 MAX_PROMPT_CHARS = 20_000
 DEFAULT_TURN_TIMEOUT_S = 600
 ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TZ")
+SKILL_TOOL = "Skill"
+# Spike with Claude Code 2.1.302: plugin hooks run arbitrary commands even under
+# --restricted and --strict-mcp-config, with the session environment and the config
+# dir. "disableAllHooks" turns them off and keeps skills working (verified), and
+# --settings still applies under --restricted. With "ask" for Skill, every Skill
+# tool call goes through --permission-prompt-tool (verified; without it the Skill
+# tool asks nobody and can load built-in skills such as update-config).
+HARDENED_SETTINGS = json.dumps(
+    {"disableAllHooks": True, "permissions": {"ask": [SKILL_TOOL]}}, separators=(",", ":")
+)
 
 
 class BridgeError(RuntimeError):
@@ -43,11 +55,22 @@ class BridgeConfig:
     mcp_config: Path | None = None
     permission_tool: str | None = None
     system_prompt_file: Path | None = None
-    plugin_dirs: tuple[Path, ...] = ()
+    plugin_dirs: tuple[Path, ...] = ()  # one directory per plugin, never a parent folder
+    expected_plugins: tuple[str, ...] = ()  # plugin names from plugin_dirs, for the init tripwire
+    expected_mcp: tuple[str, ...] = ()  # MCP server names the init event may list
+    allowed_skills: tuple[str, ...] = ()  # "<plugin>:<name>" the Skill tool and "/" messages may use
+    persist_session: bool = True  # False: --no-session-persistence (no transcript under config_dir)
     oauth_token: str | None = field(default=None, repr=False)
 
 
 def build_args(config: BridgeConfig, resume: str | None = None) -> list[str]:
+    """Command line for one locked-down Claude Code process.
+
+    --strict-mcp-config keeps plugin and claude.ai connector MCP servers out (--tools
+    does not filter MCP tools), and HARDENED_SETTINGS turns plugin hooks off and routes
+    the Skill tool through the permission tool. Neither is configurable. Every plugin
+    gets its own --plugin-dir: given a parent folder, the CLI would load every child.
+    """
     args = [
         config.claude_bin,
         "-p",
@@ -56,6 +79,7 @@ def build_args(config: BridgeConfig, resume: str | None = None) -> list[str]:
         "--verbose",
         "--restricted",
         "--strict-mcp-config",
+        "--settings", HARDENED_SETTINGS,
         "--tools", ",".join(config.tools),
         "--model", config.model,
     ]
@@ -67,6 +91,8 @@ def build_args(config: BridgeConfig, resume: str | None = None) -> list[str]:
         args += ["--append-system-prompt-file", str(config.system_prompt_file)]
     for plugin_dir in config.plugin_dirs:
         args += ["--plugin-dir", str(plugin_dir)]
+    if not config.persist_session:
+        args.append("--no-session-persistence")
     if resume:
         args += ["--resume", resume]
     return args

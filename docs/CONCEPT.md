@@ -52,14 +52,19 @@ Normal notifications stay in whatever chat channel you already use. The phone ri
 | `escalation.py` | Decides whether an event may call: severity, de-duplication, interval, daily cap, quiet hours, acknowledgements |
 | `conversation.py` | The call as a deterministic state machine: PIN, alert, menu |
 | `telephony.py` | Fake provider, Twilio REST call, TwiML rendering, webhook signature check |
-| `server.py` | Local HTTP server, session watch thread |
+| `server.py` | Local HTTP server, session watch thread, morning brief thread |
 | `bridge.py` | One locked-down Claude Code process per conversation (stream-json) |
 | `approval.py` | Approval levels, the broker behind a private Unix socket, the terminal prompt |
 | `approval_server.py` | The permission tool Claude Code calls (stdio MCP server, standard library only) |
 | `quota.py` | Quota guard: refuses a turn before any model call when the subscription window is nearly used up or paid usage shows up |
-| `router.py` | Three tiers: fixed answers, a small model without tools, the main locked-down session |
+| `router.py` | Three tiers: fixed answers, a small model without tools, the main locked-down session; `note` capture, slash-command allowlist, note excerpts |
+| `vault.py` | The Markdown vault (the assistant's workspace): skeleton, note capture, relevant-note selection, safe fd-based file access |
+| `plugins.py` | Plugin checker (read-only, fd-based), enable/disable by checked copy plus digest registry, loading per chat start |
+| `brief.py` | Morning brief: deterministic content, Discord rendering and chunking, optional polish by the small model, once-per-day state and scheduler |
+| `textsafe.py` | One definition of invisible and control characters for all untrusted text |
 | `remote.py` | Remote approvals: Discord webhook notice, one-time approval page, the chat-side channel |
-| `cli.py` | `serve`, `escalate`, `status`, `simulate`, `chat` |
+| `cli.py` | `serve`, `escalate`, `status`, `simulate`, `chat`, `vault`, `plugins`, `brief` |
+| `plugins/core/` (repo folder, not a module) | The shipped core plugin: skills `organize-inbox`, `daily-plan` and `capture-note` for the vault; checked like any other plugin |
 
 ## v1 scope (this release)
 
@@ -145,6 +150,130 @@ than sent to the page. At most five requests are pending and at most five notice
 minutes. Logs carry only the first six characters of an id, never the webhook URL, the CSRF token, the
 PIN or the input.
 
+### 3a. Vault and notes
+
+The chat's working directory is the vault (`raw/` captures, `wiki/` articles, `heute.md`, `outputs/`).
+Notes hold captured mail and web text, so they are treated as hostile data:
+
+- **Excerpts are delimited and escaped reference data.** Relevant paragraphs from `wiki/` and
+  `heute.md` (never `raw/` or `outputs/`) are picked with a small token, file-name and recency score
+  within a character budget, and placed before the message in `<vault-excerpts id="<random per turn>">`.
+  Text and paths are escaped (`& < > " '`), so a note cannot close the block, open a new one or forge
+  attributes; the person's request follows in `<user-message>`. A system prompt file (0600, in the
+  broker's runtime directory outside the vault) states the layout and that excerpts and file contents
+  are data, never instructions. Auto-loading of the vault's `CLAUDE.md` under `--restricted` is not
+  relied on.
+- **Approval context.** When a turn carries excerpts or used a plugin skill, every approval prompt in it
+  says that the request may come from note text or a plugin skill. A typed `/<plugin>:<name>` command is
+  expanded by Claude Code itself, without a Skill tool call, so the router marks such a turn before it
+  is sent.
+- **Slash-command allowlist.** Claude Code expands any message that starts with `/` (built-in commands
+  such as `/config` or `/clear` included). The final body of every turn, after `!` and after leading
+  whitespace and invisible characters, may start with `/` only when its first word is an allowlisted
+  `/<plugin>:<name>`; everything else is refused without starting a session.
+- **Capture without a model.** `note <text>` appends one line to `raw/inbox-YYYY-MM-DD.md`. Control
+  and invisible characters (bidi, zero-width, Unicode TAG characters, variation selectors, private use)
+  are removed, and the text cannot fake a task (`[ ]`) or a processed marker.
+- **File-system rules.** Sync tools can place symlinks and FIFOs in the vault. Reads walk directory
+  descriptors, skip symlinks, hidden and non-regular entries, open with `O_NOFOLLOW | O_NONBLOCK`, check
+  the descriptor with `fstat`, and are capped (512 KiB per file, 2000 files, 8 MiB per scan). Writes walk
+  fd-relative with `O_NOFOLLOW` on every component; outputs are written to a temporary file and renamed
+  within the same directory descriptor.
+- **Workdir guard.** The vault must not contain the package, interpreter, Claude Code binary or config,
+  state, status, plugins or runtime directories or state files, and must not lie inside the status,
+  config, plugins or runtime directory.
+
+### 3b. Plugins
+
+Extensions are standard Claude Code plugins. Their skill, command and agent text goes into the model
+context, and some plugin features run code, so every plugin is checked before it is enabled and again on
+every chat start. Evidence from a test with Claude Code 2.1.302 (real CLI, minimal environment, the
+bridge's flags plus `--plugin-dir`):
+
+- Plugin **hooks ran arbitrary shell commands** despite `--restricted` and `--strict-mcp-config`, before
+  the init event, in the session's working directory and with its environment (an OAuth token when one is
+  passed) and config dir. `--settings '{"disableAllHooks":true}'` stopped them and kept skills working;
+  `--bare` also stops them but breaks the subscription login.
+- A plugin's **MCP server started** as soon as `--strict-mcp-config` was missing, together with the
+  account's connector servers, whose tools appeared although `--tools` did not name them. `--tools`
+  filters only built-in tools.
+- The **Skill tool asked nobody** by default and the init event listed built-in skills such as
+  `update-config` and `schedule`. With `"permissions":{"ask":["Skill"]}` every Skill call went through
+  `--permission-prompt-tool` with input `{"skill": "<name>"}`.
+- A message starting with `/` was expanded by the CLI itself, even without the Skill tool.
+
+Hence:
+
+- **Checker (the boundary).** Refused without any override: hooks (folder, manifest key, frontmatter
+  key), MCP and language servers, `allowed-tools`/`model`/`tools`/`permissionMode`, unknown manifest or
+  frontmatter keys, YAML that a small parser could read differently from the CLI's real parser (BOM,
+  `\r`, tabs, duplicate or quoted keys, flow, block, anchor, tag and merge syntax, comments), symlinks,
+  hard links, special files, executable bits, binaries and shebangs, hidden entries and odd names,
+  supporting files in skill folders (the plugin folder is outside the vault, so a skill must be one
+  self-contained `SKILL.md`), and caps on depth, files, sizes and components. Content scans run on
+  NFKC-normalised, casefolded lines: credentials (reported by line, never echoed), URLs and network tools
+  in prompt text, encoded blobs, `eval`/`exec`, shell expansion (``!` ``, fenced `!` blocks, `$(`, `${`),
+  `@file` references (quoted forms such as `@"~/x"` included) and invisible characters. Descriptions sit in the context on every turn, so an
+  override phrase there is an error and all loaded plugins together get 4 KiB of descriptions. The checker
+  never runs plugin code, walks directory descriptors without following symlinks and opens files
+  non-blocking with an `fstat` check.
+- **Checked copy plus digest.** `enable` writes exactly the bytes it checked into a staging folder (files
+  0644, folders 0755, no metadata), checks the copy again, compares digests and renames it into
+  `state_dir/plugins/<name>`. The registry (`plugins.json`, outside the plugins folder) holds the digest;
+  a plugin edited afterwards is skipped at the next start. State and plugins folders must be real
+  directories owned by the user and not writable by group or others. `core` and `cc-*` are reserved.
+- **Session hardening.** Every session (main and small) runs with `--strict-mcp-config` and
+  `--settings '{"disableAllHooks":true,"permissions":{"ask":["Skill"]}}'`. The broker allows a Skill
+  call only for `<plugin>:<name>` of a loaded, checked plugin and denies everything else without asking.
+  One `--plugin-dir` per plugin, never a parent folder. The small model session gets no plugins.
+- **Slash allowlist.** Only `/<plugin>:<name>` words enumerated by the checker pass; `!/config`,
+  `/core` or an invisible character before `/` are refused before any session starts.
+- **Stream tripwire (not a boundary).** The router aborts the turn, stops the process and refuses
+  further turns until restart on any `hook*` system event, on an init event listing a tool outside the
+  allowlist, an MCP server other than the approval server, a non-built-in plugin that was not passed (or
+  from another path), a skill of an unknown plugin, or malformed lists, and on a Skill tool call outside
+  the allowlist. It is only a tripwire: a UserPromptSubmit hook emits no event, and a SessionStart hook
+  has already run when its event arrives.
+- **Core plugin, no exceptions.** The shipped `plugins/core` (skills `organize-inbox`, `daily-plan`,
+  `capture-note`) gets no special trust: it passes the same checker on every chat start (a test checks
+  the real folder), has no hooks, MCP servers, commands or agents, and is loaded first with its own
+  `--plugin-dir`. Its skills use only the vault file tools, so every write still goes through the
+  approval broker; they tell the model to stay inside the vault layout, keep writes few, never touch
+  `CLAUDE.md`, `outputs/`, `.git` or `.claude`, and treat note text as data. The name `core` is reserved
+  so an enabled copy cannot shadow it.
+
+### 3c. Morning brief
+
+The brief pushes private and untrusted text (tasks and notes hold captured mail and web text) to an
+outside service, and it runs unattended. Hence:
+
+- **No model by default.** The brief is built deterministically from the vault, the status files and the
+  quota state, and written to `outputs/brief-YYYY-MM-DD.md`. `raw/` tasks are left out.
+- **Counts only to Discord by default** (`PA_BRIEF_DISCORD=counts`). With `full`, every vault- or
+  status-derived string goes through the same escaper as the approval notices (`discord_safe`: no
+  markup, no mentions) and URLs are defanged (`https[:]//`), so masked links and fake headings cannot
+  render. Payloads keep `allowed_mentions: {"parse": []}` and suppress embeds; messages are split at line
+  boundaries into at most five chunks of 1900 characters.
+- **Polish is optional and contained.** The small model gets the escaped brief inside `<brief>` with no
+  tools, no MCP, no plugins, no transcript (`--no-session-persistence`) and a fresh private working
+  directory outside the vault, through the same stream tripwire as the chat. A fresh quota guard is read
+  for every run and a blocked guard starts no process. Output that adds a URL, a domain, an `@` or a
+  number not in the deterministic brief is rejected. At most one model call per day; the result is reused
+  from `state_dir/brief-polished.json`, never from the vault copy (the assistant can write `outputs/`, so
+  injected note text could plant a "polished" file there). The scheduler polishes only in `full` mode,
+  where the text is actually shown.
+- **At most once per day.** `brief.json` records the day, `sending`/`sent`/`failed`, attempts and the
+  chunks already posted. Every run holds an flock on `brief.lock`; the scheduler takes it without waiting
+  and decides on the state it re-reads under the lock. `sending` is written before the first post and a
+  failure to write it means no post; a leftover `sending` after a crash counts as sent. Retries: at most
+  three, five minutes apart, inside the grace window, resuming after the chunks already posted. The resume
+  source is the stored chunk list of the failed attempt (`state_dir/brief-chunks.json`, checked against
+  the digest in `brief.json`), not a fresh rendering: quota, session status and captures change between
+  attempts, and a new rendering would repost chunks that already went out. In-memory
+  counters per day keep a deleted, corrupt or unwritable state file from causing a post on every tick.
+  Downtime past the grace window means no post that day and no catch-up. The state folder must be a real
+  directory owned by the user and not writable by others.
+
 ### 4. Caller authentication
 
 - v1 only places **outbound** calls to one configured number. Inbound calls are not accepted.
@@ -201,6 +330,7 @@ session. A leading `!` forces the main session.
 | Version | Content | Main risk handled |
 |---|---|---|
 | **v1** | Escalation call, session status by phone, acknowledge, simulator | Noise and cost (limits), caller auth |
+| phase 2 | Vault workspace with note capture and note excerpts (done); checked plugins (done); morning brief (done); core skills plugin (done) | Injection from note text (delimited, escaped excerpts; slash allowlist); code execution and injection through plugins (checker, hooks off, Skill allowlist, tripwire); private text in Discord and send storms (counts by default, escaping, once-per-day state under a lock) |
 | v2 | Conversational call (speech in/out via a realtime voice pipeline such as Pipecat or LiveKit Agents), optional LLM summary of status; send a message to a waiting session after spoken confirmation + PIN | Injection from session text into the voice model |
 | v3 | Mail reader: classify and summarise mail, write reply **drafts**; approval flow (chat or phone) before sending | Injection from mail content, separate process and credentials |
 | v4 | Voice dashboard (status, numbers, news) | Exposure of a web UI, auth |

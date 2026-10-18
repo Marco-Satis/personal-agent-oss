@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -153,13 +155,24 @@ class QuotaGuard:
     def _save(self) -> None:
         if self.state_file is None:
             return
+        # A unique temp name: the chat and the serve process (brief polish) may save at
+        # the same time, and a shared fixed ".tmp" name would let one clobber the other.
+        tmp: str | None = None
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.state_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._data), encoding="utf-8")
-            tmp.replace(self.state_file)
+            fd, tmp = tempfile.mkstemp(dir=self.state_file.parent, prefix=".quota-", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(self._data))
+            os.replace(tmp, self.state_file)
+            tmp = None
         except OSError as exc:
             log.warning("could not save quota state: %s", type(exc).__name__)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def observe(self, info: dict | None) -> None:
         """Record one `rate_limit_info` object from a rate_limit_event."""
