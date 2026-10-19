@@ -28,11 +28,14 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .bridge import MAX_PROMPT_CHARS, SKILL_TOOL, UnexpectedOutput
 from .quota import RESET_COMMAND, SUBSCRIPTION_KEY_SOURCE, QuotaGuard, is_overage
+from .statefiles import read_private_json, remove_private, write_private_json
 from .status import SessionStatus, clean_text, format_status_line, render_sessions, views_from_statuses
 from .textsafe import is_unsafe
 from .tasks import Command, parse_command
@@ -46,6 +49,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 FORCE_PREFIX = "!"
+LOCAL_ONLY = "Only in the terminal: session lists stay on this machine."
 FIXED_COMMANDS = {
     "help": ("help", "/help", "?", "hilfe"),
     "status": ("status", "/status"),
@@ -108,20 +112,52 @@ class UnsafeInput(SafetyStop):
     """Raised before anything is sent: the body must not reach Claude Code."""
 
 
+SAFETY_FILE = "safety-stop.json"  # the cross-process stop in the state directory
+SAFETY_FILE_VERSION = 1
+SAFETY_FILE_CAP = 4096
+
+
+def read_shared_stop(state_dir: Path) -> str | None:
+    """The reason of the cross-process safety stop in state_dir, or None."""
+    data = read_private_json(state_dir, SAFETY_FILE, SAFETY_FILE_CAP, SAFETY_FILE_VERSION)
+    if data is None:
+        return None
+    reason = data.get("reason")
+    return (clean_text(reason, 120) or "safety stop") if isinstance(reason, str) else "safety stop"
+
+
+def clear_shared_stop(state_dir: Path) -> bool:
+    """Remove the cross-process safety stop (terminal only). True if one was set."""
+    present = os.path.lexists(Path(state_dir) / SAFETY_FILE)
+    remove_private(Path(state_dir), SAFETY_FILE)
+    return present
+
+
 class SafetyLatch:
-    """One safety stop for every session of a chat: the main session and all helpers.
+    """One safety stop for every session: the main session, all helpers and, with a state
+    directory, every other process of this agent (the chat and serve's Telegram assistant).
 
     The sessions share the Claude Code config dir and login, so a hook or plugin
     surprise in one is a risk for all. The first reason wins; listeners (e.g. the
     task coordinator, which then stops its helpers) are told once. Thread-safe.
+
+    With state_dir, trip() also writes state_dir/safety-stop.json, and `reason` adopts a
+    stop that another process wrote (an mtime-cached read). Only the terminal clears that
+    file (`personal-agent safety clear`, or a confirmed question at chat start).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state_dir: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._reason: str | None = None
         self._listeners: list[Callable[[str], None]] = []
+        self.state_dir = Path(state_dir) if state_dir is not None else None
+        self._file_key: tuple[int, int, int] | None = None
 
-    def trip(self, reason: str) -> None:
+    @property
+    def shared(self) -> bool:
+        return self.state_dir is not None
+
+    def _set(self, reason: str, write: bool) -> None:
         with self._lock:
             if self._reason is not None:
                 return
@@ -129,11 +165,45 @@ class SafetyLatch:
             reason_text = self._reason
             listeners = list(self._listeners)
         log.warning("safety latch tripped: %s", reason_text)
+        if write and self.state_dir is not None:
+            write_private_json(self.state_dir, SAFETY_FILE,
+                               {"version": SAFETY_FILE_VERSION, "reason": reason_text, "at": time.time()})
         for listener in listeners:
             try:
                 listener(reason_text)
             except Exception as exc:  # noqa: BLE001 - a listener must never undo the stop
                 log.warning("safety latch listener failed: %s", type(exc).__name__)
+
+    def trip(self, reason: str) -> None:
+        self._set(reason, write=True)
+
+    def _check_shared(self) -> None:
+        """Adopt a stop written by another process; the file is read only when it changed."""
+        if self.state_dir is None:
+            return
+        try:
+            info = os.stat(self.state_dir / SAFETY_FILE, follow_symlinks=False)
+            key: tuple[int, int, int] | None = (info.st_mtime_ns, info.st_size, info.st_ino)
+        except OSError:
+            key = None
+        with self._lock:
+            if key == self._file_key or self._reason is not None:
+                self._file_key = key
+                return
+            self._file_key = key
+        if key is None:
+            return
+        shared = read_shared_stop(self.state_dir)
+        if shared is not None:
+            self._set(f"stopped in another session: {shared}", write=False)
+
+    def clear(self) -> None:
+        """Lift the stop in this process and remove the shared file (terminal confirmation only)."""
+        if self.state_dir is not None:
+            clear_shared_stop(self.state_dir)
+        with self._lock:
+            self._reason = None
+            self._file_key = None
 
     def add_listener(self, listener: Callable[[str], None]) -> None:
         with self._lock:
@@ -144,6 +214,7 @@ class SafetyLatch:
 
     @property
     def reason(self) -> str | None:
+        self._check_shared()
         with self._lock:
             return self._reason
 
@@ -405,8 +476,11 @@ class Router:
         tasks: "TaskService | None" = None,
         domains: "Domains | None" = None,
         sessions: Callable[[], str] | None = None,
+        local_listings: bool = True,
+        note_source: str | None = None,
     ) -> None:
         self.main = main
+        self.note_source = note_source  # trusted: "telegram" marks notes captured over Telegram
         self.small = small if config.small_model else None
         self.guard = guard
         self.config = config
@@ -422,6 +496,9 @@ class Router:
         self.domains = domains  # None: no vault
         # The read-only `sessions` view; None: built from the hook status files only.
         self.sessions = sessions
+        # False (serve's Telegram assistant): `status` and `sessions` list nothing, because
+        # project names and waiting texts of every Claude Code session would leave the machine.
+        self.local_listings = local_listings
 
     @property
     def halted(self) -> str | None:
@@ -482,6 +559,8 @@ class Router:
 
     def _sessions(self) -> Reply:
         """The person's Claude Code sessions, waiting first. Read-only: nothing is sent anywhere."""
+        if not self.local_listings:
+            return Reply(LOCAL_ONLY, 1)
         try:
             if self.sessions is not None:
                 return Reply(self.sessions(), 1)
@@ -507,7 +586,8 @@ class Router:
         if self.vault is None:
             return Reply("no vault configured", 1, is_error=True)
         try:
-            path = self.vault.capture(argument)
+            path = self.vault.capture(argument, source=self.note_source) if self.note_source else \
+                self.vault.capture(argument)
         except VaultError as exc:
             return Reply(str(exc), 1, is_error=True)
         return Reply(f"noted in {path}", 1)
@@ -532,6 +612,8 @@ class Router:
         if command == "help":
             return self.help_text()
         if command == "status":
+            if not self.local_listings:
+                return LOCAL_ONLY
             statuses = self.statuses()
             if not statuses:
                 return "no session status"
@@ -542,6 +624,13 @@ class Router:
         return self.guard.describe()
 
     # --- tiers 2 and 3 ----------------------------------------------------------
+
+    def is_tier1(self, text: str) -> bool:
+        """Whether handle(text) answers without any model (notes, task commands, fixed answers)."""
+        if prefix_command(text) is not None or parse_command(text) is not None:
+            return True
+        tier, body = choose_tier(text, self.config)
+        return tier == 1 or not body or slash_problem(body, self.slash_commands) is not None
 
     def handle(self, text: str, on_event: Callable[[dict], None] | None = None) -> Reply:
         prefixed = prefix_command(text)
@@ -561,9 +650,12 @@ class Router:
         slash = strip_leading(body).startswith("/")
         if slash:
             body = strip_leading(body)  # verbatim, so the CLI sees the leading "/"
-        if self.halted:
+        halted = self.halted
+        if halted:
+            hint = " A stop shared by all sessions is cleared in a terminal: personal-agent safety clear." \
+                if self.latch.shared else ""
             return Reply(
-                f"Not sent: the assistant was stopped earlier ({self.halted}). Restart the chat.",
+                f"Not sent: the assistant was stopped earlier ({halted}). Restart the chat.{hint}",
                 1, is_error=True, refused=True, safety=True,
             )
         check = self.guard.check()

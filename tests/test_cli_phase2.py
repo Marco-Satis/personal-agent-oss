@@ -141,7 +141,7 @@ def test_brief_cli_without_vault_and_send_without_webhook(env, capsys):
     assert main(["brief"]) == 0
     assert "(no vault)" in capsys.readouterr().out
     assert main(["brief", "--send"]) == 2
-    assert "--send needs PA_DISCORD_WEBHOOK" in capsys.readouterr().err
+    assert "--send needs a brief channel (a paired Telegram bot or PA_DISCORD_WEBHOOK)" in capsys.readouterr().err
 
 
 # --- chat with the vault ------------------------------------------------------------

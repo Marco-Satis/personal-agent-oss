@@ -19,7 +19,14 @@ bridge gateway) and the request carries no forwarding header, because many
 tunnel tools forward the whole port when no path is given.
 
 With PA_BRIEF_TIME set, a separate thread sends the morning brief once per day
-(see brief.BriefScheduler).
+(see brief.BriefScheduler). Notices (brief, alerts, task counts, info) go through
+one notification layer (notify.Notifier, PA_NOTIFY_<KIND>); an alert is sent after
+every escalation decision, asynchronously, so /escalate never waits for it.
+
+With PA_TELEGRAM_TOKEN set and the bot paired (`personal-agent telegram pair`),
+serve also runs the Telegram assistant (telegram_bot.TelegramService): long polling
+only, outbound HTTPS, no inbound port. Its approvals and console approvals share
+one inbox. SIGTERM shuts down cleanly (threads joined, Claude Code processes stopped).
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import signal
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,12 +46,14 @@ from .config import Config
 from .conversation import Call, CallRegistry
 from .escalation import EscalationPolicy, Event
 from .approval import CONFIRM_WORD
-from .remote import ID_RE, TEXTS, ApprovalInbox, DiscordWebhook, render_message, render_page
+from .notify import Notifier, alert_notice, alert_outcome, resolve_route
+from .remote import ID_RE, ORIGIN_RE, TEXTS, ApprovalInbox, DiscordWebhook, render_message, render_page
 from .status import read_statuses
 from .telephony import CallProvider, FakeProvider, TwilioProvider, render_twiml, valid_twilio_signature
 
 if TYPE_CHECKING:
     from .brief import BriefScheduler
+    from .telegram_bot import TelegramService
 
 log = logging.getLogger(__name__)
 
@@ -72,17 +82,23 @@ class Agent:
     """Wires policy, provider, call registry and status together."""
 
     def __init__(
-        self, config: Config, provider: CallProvider | None = None, approvals: ApprovalInbox | None = None
+        self, config: Config, provider: CallProvider | None = None, approvals: ApprovalInbox | None = None,
+        notifier: Notifier | None = None, telegram: "TelegramService | None" = None,
     ) -> None:
         self.config = config
+        self.notifier = notifier
+        self.telegram = telegram
         if approvals is None and config.remote_approvals:
-            assert config.discord_webhook and config.public_approval_url
             approvals = ApprovalInbox(
-                DiscordWebhook(config.discord_webhook),
+                DiscordWebhook(config.discord_webhook) if config.discord_webhook else None,
                 config.public_approval_url,
                 config.language,
                 config.approval_timeout_s,
                 pin=config.approval_pin,
+                route=self.approval_route,
+                telegram=telegram.approval_sender if telegram is not None else None,
+                on_final=telegram.on_final if telegram is not None else None,
+                state_dir=config.state_dir,
             )
         self.approvals = approvals
         self.policy = EscalationPolicy(
@@ -103,6 +119,15 @@ class Agent:
     def statuses(self):
         return read_statuses(self.config.status_dir, self.config.status_max_age_min)
 
+    def approval_route(self) -> str | None:
+        """The channel of a console approval right now (PA_NOTIFY_APPROVAL or the default)."""
+        if self.telegram is not None:
+            ready = self.telegram.target.ready() is None and not self.telegram.hijacked
+        else:
+            ready = self.notifier.telegram_ready() if self.notifier is not None else False
+        route = resolve_route(self.config, "approval", ready)
+        return route[0] if route else None
+
     def new_call(self, event: Event) -> Call:
         assert self.config.call_pin
         return Call(
@@ -116,6 +141,11 @@ class Agent:
         )
 
     def escalate(self, event: Event) -> dict:
+        result = self._decide_and_call(event)
+        self._alert(event, result)
+        return result
+
+    def _decide_and_call(self, event: Event) -> dict:
         decision = self.policy.decide(event)
         log.info("event %s (%s): call=%s, %s", event.key, event.severity, decision.call, decision.reason)
         if not decision.call:
@@ -129,6 +159,16 @@ class Agent:
             log.error("placing the call failed: %s", type(exc).__name__)
             return {"called": False, "reason": "provider error"}
         return {"called": True, "reason": decision.reason}
+
+    def _alert(self, event: Event, result: dict) -> None:
+        """The alert notice (PA_NOTIFY_ALERT): queued, deduplicated per key; never affects the call."""
+        if self.notifier is None:
+            return
+        try:
+            outcome = alert_outcome(bool(result.get("called")), str(result.get("reason", "")), self.config.language)
+            self.notifier.send("alert", alert_notice(event, outcome, self.config.language), key=event.key)
+        except Exception as exc:  # noqa: BLE001 - a notice never changes the call decision
+            log.warning("alert notice failed: %s", type(exc).__name__)
 
     def check_waiting_sessions(self) -> None:
         """Escalate sessions that wait for input longer than configured."""
@@ -289,19 +329,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         level, timeout_s = data.get("level"), data.get("timeout_s")
         tool_name, summary = data.get("tool_name"), data.get("summary")
+        origin, context = data.get("origin", "chat"), data.get("context", False)
         if (
             type(level) is not int or level not in (2, 3)
             or type(timeout_s) is not int or not 1 <= timeout_s <= 3600
             or not isinstance(tool_name, str) or not tool_name or len(tool_name) > 200
             or not isinstance(summary, str) or len(summary) > 2000
+            or not isinstance(origin, str) or not ORIGIN_RE.fullmatch(origin)
+            or type(context) is not bool
         ):
             self._json(400, {"error": "invalid request"})
             return
-        entry = inbox.register(tool_name, level, summary, timeout_s)
+        entry = inbox.register(tool_name, level, summary, timeout_s, origin=origin, context=context)
         if entry is None:
             self._json(429, {"error": "not available"})
             return
-        self._json(200, {"id": entry.id})
+        self._json(200, {"id": entry.id, "via": entry.via})
 
     def _internal_state(self, approval_id: str, query: str) -> None:
         inbox = self._internal_guard()
@@ -456,7 +499,8 @@ def _brief_loop(scheduler: "BriefScheduler", stop: threading.Event, interval_s: 
             break
 
 
-def start_brief_thread(config: Config, stop: threading.Event) -> threading.Thread | None:
+def start_brief_thread(config: Config, stop: threading.Event,
+                       notifier: Notifier | None = None) -> threading.Thread | None:
     """Start the daily brief in its own thread (separate from the session watch), or None when off.
 
     Local time comes from the process (TZ). The webhook is never logged.
@@ -465,8 +509,8 @@ def start_brief_thread(config: Config, stop: threading.Event) -> threading.Threa
         return None
     from .brief import BriefScheduler
 
-    thread = threading.Thread(target=_brief_loop, args=(BriefScheduler(config), stop), daemon=True,
-                              name="morning-brief")
+    thread = threading.Thread(target=_brief_loop, args=(BriefScheduler(config, notifier=notifier), stop),
+                              daemon=True, name="morning-brief")
     thread.start()
     hour, minute = config.brief_time
     log.info("morning brief daily at %02d:%02d (grace %d min)", hour, minute, config.brief_grace_min)
@@ -481,14 +525,38 @@ def serve(config: Config) -> None:
         log.warning(
             "binding to %s: make sure /escalate and /internal/ are not reachable from outside", config.bind_host
         )
-    agent = Agent(config)
+    from .telegram import install_excepthooks, install_redaction
+
+    install_redaction(config)
+    install_excepthooks()
+    telegram: "TelegramService | None" = None
+    if config.telegram_token:
+        from .telegram_bot import TelegramService
+
+        notifier = Notifier.from_config(config)
+        telegram = TelegramService(config, notifier)
+        notifier.targets["telegram"] = telegram.target  # one client, one cooldown and pacing state
+    else:
+        notifier = Notifier.from_config(config)
+    agent = Agent(config, notifier=notifier, telegram=telegram)
     if agent.approvals is not None:
         log.info("remote approvals enabled: forward only /approve/ (never /internal/) to your phone")
     server = make_server(agent)
     stop = threading.Event()
-    watcher = threading.Thread(target=_watch_loop, args=(agent, stop), daemon=True)
+    watcher = threading.Thread(target=_watch_loop, args=(agent, stop), daemon=True, name="session-watch")
     watcher.start()
-    start_brief_thread(config, stop)
+    start_brief_thread(config, stop, notifier)
+    if telegram is not None:
+        telegram.start(agent.approvals)
+        log.info("telegram enabled: the assistant polls once the bot is paired (personal-agent telegram pair)")
+
+    def on_sigterm(_signum: int, _frame: object) -> None:
+        # serve_forever runs in this (main) thread: shutdown() must come from another one.
+        threading.Thread(target=server.shutdown, name="shutdown", daemon=True).start()
+
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGTERM, on_sigterm)
     log.info("listening on %s:%s (provider: %s)", config.bind_host, config.port, config.provider)
     try:
         server.serve_forever()
@@ -496,4 +564,9 @@ def serve(config: Config) -> None:
         pass
     finally:
         stop.set()
+        if telegram is not None:
+            telegram.close(join_s=8.0)
+        notifier.close(5.0)
         server.server_close()
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)

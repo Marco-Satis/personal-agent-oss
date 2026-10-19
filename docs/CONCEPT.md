@@ -54,22 +54,27 @@ Normal notifications stay in whatever chat channel you already use. The phone ri
 | `escalation.py` | Decides whether an event may call: severity, de-duplication, interval, daily cap, quiet hours, acknowledgements |
 | `conversation.py` | The call as a deterministic state machine: PIN, alert, menu |
 | `telephony.py` | Fake provider, Twilio REST call, TwiML rendering, webhook signature check |
-| `server.py` | Local HTTP server, session watch thread, morning brief thread |
+| `server.py` | Local HTTP server, session watch thread, morning brief thread, the Telegram service, clean shutdown on SIGTERM |
 | `bridge.py` | One locked-down Claude Code process per conversation (stream-json) |
 | `approval.py` | Approval levels, the broker behind a private Unix socket, the terminal prompt |
 | `approval_server.py` | The permission tool Claude Code calls (stdio MCP server, standard library only) |
 | `quota.py` | Quota guard: refuses a turn before any model call when the subscription window is nearly used up or paid usage shows up |
-| `router.py` | Three tiers: fixed answers, a small model without tools, the main locked-down session; `note` capture, slash-command allowlist, note excerpts |
+| `router.py` | Three tiers: fixed answers, a small model without tools, the main locked-down session; `note` capture, slash-command allowlist, note excerpts; the safety latch shared by every process (`safety-stop.json`) |
 | `vault.py` | The Markdown vault (the assistant's workspace): skeleton, note capture, relevant-note selection, safe fd-based file access |
 | `plugins.py` | Plugin checker (read-only, fd-based), enable/disable by checked copy plus digest registry, loading per chat start |
-| `brief.py` | Morning brief: deterministic content, Discord rendering and chunking, optional polish by the small model, once-per-day state and scheduler |
+| `brief.py` | Morning brief: deterministic content, rendering per channel (Discord markup-escaped, plain text), optional polish by the small model, once-per-day state per channel and scheduler |
+| `notify.py` | The notification layer: notice kinds (brief, alert, approval, task_done, info), `PA_NOTIFY_<KIND>` routes and defaults, channel limits and chunking, the only renderers notices may use (privacy by construction), async sender with per-kind limits |
+| `statefiles.py` | Small private JSON files in the state directory: atomic 0600 writes, reads that refuse links, foreign owners, oversize files and other versions |
 | `tasks.py` | The task board (state_dir/tasks.json, atomic, flock, compare-and-set transitions), tier-1 task commands, helper prompt and result file rendering |
-| `coordinator.py` | Runs tasks in locked-down helper sessions (at most two), watchdog, cancel, quota and latch handling; the task facade for the router and delegation; counts-only Discord notices |
+| `coordinator.py` | Runs tasks in locked-down helper sessions (at most two), watchdog, cancel, quota and latch handling; the task facade for the router and delegation; task notices (counts, optionally id and title) through `notify.py` |
 | `domains.py` | Domain memory files (`wiki/domains/<domain>.md`): links (depth 1, at most five), skeleton creation, budgeted notes for helper prompts, tier-1 `domains`/`domain <name>` |
 | `console.py` | The chat terminal: one owner of stdin for `you>` and approval prompts, non-blocking notices |
 | `textsafe.py` | One definition of invisible and control characters for all untrusted text |
-| `remote.py` | Remote approvals: Discord webhook notice, one-time approval page, the chat-side channel |
-| `cli.py` | `serve`, `escalate`, `status`, `simulate`, `chat`, `vault`, `plugins`, `brief`, `hooks snippet` (prints only) |
+| `remote.py` | Remote approvals: one inbox for two delivery paths (Discord notice plus one-time page, Telegram buttons), button presses and the Telegram PIN, PIN lockouts across both paths, the chat-side channel |
+| `assistant.py` | Shared construction of the assistant for `chat` and serve's Telegram assistant: workdir guard, vault, plugins, broker, quota guard, latch, sessions and Router |
+| `telegram.py` | The Bot API client (HTTPS, long polling, no webhook), token redaction, the state files (owner, pairing code, offset, poll lock), pairing, the Telegram notice channel and approval prompts |
+| `telegram_bot.py` | The Telegram assistant in `serve`: supervisor, poller, inbound owner messages through the Router, approval channel, outbox |
+| `cli.py` | `serve`, `escalate`, `status`, `simulate`, `chat`, `vault`, `plugins`, `brief`, `hooks snippet` (prints only), `telegram pair/status/unpair`, `safety status/clear` |
 | `plugins/core/` (repo folder, not a module) | The shipped core plugin: skills `organize-inbox`, `daily-plan` and `capture-note` for the vault; checked like any other plugin |
 
 ## v1 scope (this release)
@@ -156,6 +161,24 @@ the agent's own deadline, and is cancelled when the agent stops waiting, so a la
 than sent to the page. At most five requests are pending and at most five notices go out per ten
 minutes. Logs carry only the first six characters of an id, never the webhook URL, the CSRF token, the
 PIN or the input.
+
+With a paired Telegram bot (by default when it is ready; `PA_NOTIFY_APPROVAL` picks a path explicitly
+and takes one value, so one request never races on two channels) the same inbox sends a Telegram
+message instead: the tool name, the level, a per-serve sequence number ("Approval #7"), the trusted
+origin label and inline buttons. Each button's callback data is its own random one-time token (22
+characters): no id, tool name, level or decision word inside. Only presses of the paired user, from
+the paired chat, on that very prompt message count; each entry is decided once and expires like a page
+link, and after the decision the buttons are removed and the text says how it ended (without the
+review link, which is a bearer capability for the page). Level 3 needs `PA_APPROVAL_PIN` typed as the
+next message within two minutes, one PIN wait at a time (pressing Approve again never extends it); three
+wrong PINs deny. Every wrong PIN from the page and from Telegram counts toward one budget, also when the
+request then ends by Deny or expiry: six wrong PINs within 24 hours (or more than three lockouts in an
+hour) disable level-3 remote approvals for 24 hours, persisted in `approval-pinlock.json` so a crash
+loop does not reset it. Every process re-reads that file when it changes, so `telegram status
+--clear-lock` in a terminal also re-enables a running serve. The internal API
+accepts a trusted origin label (`chat` or `task 3f2a9c (domain) · telegram`, checked by a strict
+pattern) and the context flag from the chat; with no channel ready it answers 429 and the chat denies.
+`NOTICE_LIMIT` counts console approvals and Telegram turns together and fails closed.
 
 ### 3a. Vault and notes
 
@@ -261,7 +284,11 @@ outside service, and it runs unattended. Hence:
   status-derived string goes through the same escaper as the approval notices (`discord_safe`: no
   markup, no mentions) and URLs are defanged (`https[:]//`), so masked links and fake headings cannot
   render. Payloads keep `allowed_mentions: {"parse": []}` and suppress embeds; messages are split at line
-  boundaries into at most five chunks of 1900 characters.
+  boundaries into at most five chunks of 1900 characters. The channels come from the notification layer
+  (3f); Telegram gets plain text (`PA_BRIEF_TELEGRAM`, default `full`) with the same strings made inert,
+  split into at most five messages of 4000 UTF-16 units. Sessions are state counts only on Telegram, in
+  every mode, and the polish input leaves the per-session lines out: session names and waiting texts
+  never reach a third party by default (the same rule as `status`/`sessions` over Telegram).
 - **Polish is optional and contained.** The small model gets the escaped brief inside `<brief>` with no
   tools, no MCP, no plugins, no transcript (`--no-session-persistence`) and a fresh private working
   directory outside the vault, through the same stream tripwire as the chat. A fresh quota guard is read
@@ -270,8 +297,11 @@ outside service, and it runs unattended. Hence:
   from `state_dir/brief-polished.json`, never from the vault copy (the assistant can write `outputs/`, so
   injected note text could plant a "polished" file there). The scheduler polishes only in `full` mode,
   where the text is actually shown.
-- **At most once per day.** `brief.json` records the day, `sending`/`sent`/`failed`, attempts and the
-  chunks already posted. Every run holds an flock on `brief.lock`; the scheduler takes it without waiting
+- **At most once per day.** `brief.json` (version 2) records the day, `sending`/`sent`/`failed`, attempts
+  and, per channel, the digest of its chunk list, the chunks already posted and whether it is done; a
+  version-1 file is migrated in memory. The day counts as sent only when every channel of the attempt is
+  done; a retry continues only the channels that are not, and a channel that became ready meanwhile is
+  not added mid-day. Every run holds an flock on `brief.lock`; the scheduler takes it without waiting
   and decides on the state it re-reads under the lock. `sending` is written before the first post and a
   failure to write it means no post; a leftover `sending` after a crash counts as sent. Retries: at most
   three, five minutes apart, inside the grace window, resuming after the chunks already posted. The resume
@@ -289,7 +319,10 @@ background and the result lands in the vault. Decisions:
 
 - **Only inside a chat (D1).** Approvals need the person, so tasks run only while a `chat` is open,
   never in `serve`. Queued tasks wait for the next chat; tasks older than `PA_TASK_MAX_AGE_H` expire
-  instead of starting a backlog unattended.
+  instead of starting a backlog unattended. `task <text>` from Telegram only queues (origin
+  `telegram`, `PA_TELEGRAM_TASKS=off` refuses it); `serve` never builds a coordinator. When a chat
+  starts such a task it prints `[tasks: task <id> was queued from Telegram: <title>]`, and its approval
+  prompts carry the label `task <id> · telegram`.
 - **The board.** `state_dir/tasks.json` (never in the vault; the workdir guard lists it), validated field
   by field on every read, at most 1 MiB, 20 open and 200 kept tasks. Every mutation re-reads the file under
   an flock on `tasks.lock` and is a compare-and-set on the task's status; saving is atomic. A second chat
@@ -361,7 +394,12 @@ background and the result lands in the vault. Decisions:
   titles, domains, errors or paths.
 - **One safety latch.** All sessions share the Claude Code config dir and login, so a safety stop in
   any of them (hook event, unexpected init, disallowed skill, output outside a turn) halts the chat and
-  aborts every running helper until restart.
+  aborts every running helper. The latch also writes `state_dir/safety-stop.json`; every process (the
+  chat and serve's Telegram assistant) adopts a stop it finds there before each tier-2/3 turn and at
+  helper start (an mtime-cached read). Only the terminal clears it: `personal-agent safety clear`, or a
+  confirmed question when a chat starts. Clearing the file never lifts the stop inside a process that
+  already holds it (a deleted file is not proof that the surprise is gone): open chats and `serve` must
+  be restarted afterwards.
 - **Our own sessions and other sessions.** The Claude Code docs (cross-session messaging) say a `-p`
   session binds an inbox socket, so the user's other sessions could message it. Hence
   `crossSessionInbound: refuse` and the deny rules, plus a tripwire in the bridge: conversation output
@@ -390,7 +428,9 @@ only **reads** about them:
   model path; a test checks the call sites), with a minimal environment (no API keys, never the
   assistant's own config dir), stdin closed, a 5 s timeout with the process group killed, a 256 KiB
   output cap, at most 100 entries and a 10 s cache. Only the basename of a working directory is kept,
-  every string is cleaned, and nothing from it is logged or sent to Discord or the phone.
+  every string is cleaned, and nothing from it is logged or sent to Discord, Telegram or the phone.
+  The Telegram assistant's Router lists no sessions at all (`status` and `sessions` answer "only in the
+  terminal").
 - **View.** Waiting sessions first, then error, working, idle; at most 20 lines. `status` and the
   phone call keep their own order (errors first). Status files stay forgeable by any local process
   of the person, which is why they may inform but never authorize anything.
@@ -398,6 +438,93 @@ only **reads** about them:
   way for a separate process to send into a running session it does not host or to answer its
   prompts. Session control is a documented design with threat model and required controls, marked
   not implemented, in [SESSION-CONTROL.md](SESSION-CONTROL.md); there is no switch for it.
+
+### 3f. Notifications
+
+Every notice that leaves the machine goes through `notify.py`. Kinds: `brief`, `alert`, `approval`,
+`task_done`, `info`; `PA_NOTIFY_<KIND>` routes each to `telegram`, `discord`, both or `none`. Without a
+route a kind goes to a paired Telegram bot when one is ready, else to Discord exactly as before (brief with
+a webhook, approvals with webhook and public URL, task counts only with `PA_TASK_DISCORD=counts`); alerts
+and info notices are opt-in on Discord, so an existing Discord setup gets no new posts. An explicit
+channel that is not ready is skipped and logged, never replaced by another one.
+
+- **Privacy by construction.** Callers cannot hand a channel free text: they pass a renderer from
+  `notify.py`. The approval renderer has no parameter for the tool input; task renderers take counts, or
+  id, status and a cleaned title of at most 60 characters with `PA_NOTIFY_TASK_DETAIL=title`, never
+  results, errors, domains or paths; info notices are fixed templates. A test walks the package source
+  and fails on any notice send that does not use one of these renderers. Untrusted fields go through the
+  channel's `inert` function (Discord: escaped markup, no mentions; plain text: no control characters);
+  URLs are always defanged.
+- **Limits.** Each channel declares its message limit (Discord 1900 characters, Telegram 4000 UTF-16
+  units) and at most five messages per notice; longer text is split at line boundaries, never inside a
+  character, and cut with a note. Alerts and info notices: at most ten per ten minutes and one per key
+  per hour (the session watch escalates the same key every minute). Alert, info and task notices are
+  queued (at most 50) for one sender thread, so `/escalate` never waits for a channel; a full queue drops
+  with one log line. Logs name the kind, the channel and the outcome, never the text.
+- **Telegram** is the owner's default channel (3g); `telegram` routes are skipped until a bot is
+  paired. Notices about Telegram itself (token rejected, bot hijacked) go only to the other channels.
+  Every Telegram message is plain text (no parse mode, so nothing to escape and no markup injection)
+  with link previews disabled.
+
+### 3g. Telegram
+
+Telegram brings notices, approvals and a chat with the assistant to the phone. It is a third party:
+bot chats are **not end-to-end encrypted**, so the conversation, the full brief (default `full` on
+Telegram), alert summaries (status-hook text, defanged), the titles of delegated tasks (with
+`PA_NOTIFY_TASK_DETAIL=title`), approval tool names and the optional review link pass through its
+servers. Discord keeps counts by default.
+
+- **No inbound port.** Long polling (`getUpdates`) over outbound HTTPS to `api.telegram.org`; no
+  webhook mode. The API base is not configurable from the environment (a stray loopback address in a
+  real `.env` would send the token in clear text to whatever local process holds that port); tests
+  replace it in code. Redirects are never followed; a loopback test server never goes through a proxy.
+- **Owner binding.** `personal-agent telegram pair` creates a one-time code (192 bits, single use, 10
+  minutes, stored only as SHA-256) and binds the first private-chat `/start <code>` from a person, by
+  user id **and** chat id, after a `y` in the terminal (`--yes` without a terminal; the code is not
+  printed to a non-terminal stdout without `--print-code`). Wrong codes get no reply; five from one
+  sender make it ignored for the window, fifty in total drop the code. Groups, channels, other users,
+  bots, forwarded messages and messages sent via an inline bot are ignored or refused without
+  executing anything; ignored updates produce at most one log line per ten minutes, without ids or
+  content. Only one process polls (`telegram.lock`, an flock), so `pair` and `serve` never conflict.
+- **At most once.** The update offset is saved before a batch is handled; if it cannot be saved, the
+  batch is not handled. The last owner message id and the handled button ids are kept as a second guard,
+  so a lost offset file cannot replay a note, a task or a press. `getUpdates` asks for 20 updates at a
+  time with a 2 MiB cap; oversized answers fall back to one update at a time and, if one update alone is
+  too big, skip it by the id read from the truncated prefix, so a stranger cannot make the bot deaf.
+- **A compromised account** can chat and approve level 2 with one tap: over Telegram, level 2 confirms
+  intent and is not a security boundary. It can also read any file in the vault through the assistant
+  (level-1 reads need no approval) and see domain files and task results (`domain <name>`, `task
+  show`). It cannot: approve level 3 without the PIN (three wrong PINs deny, lockouts disable level 3),
+  reset the quota data, see the session lists (`status` and `sessions` stay in the terminal), delegate
+  (the broker of the Telegram assistant refuses `delegate_task` itself), run tasks (they only queue and
+  run with the console's approvals), use more than `PA_TELEGRAM_MAX_TURNS_PER_HOUR` model turns, or
+  plant notes unmarked (Telegram notes carry `[via telegram]`, and excerpts containing it are flagged
+  with `source="telegram"`). `PA_TELEGRAM_INBOUND=off` turns the chat off and keeps approvals; `/lock`
+  in the chat removes the pairing from the phone.
+- **The PIN travels through Telegram.** The PIN message is deleted (best effort) and never routed,
+  queued or logged. A message equal to `PA_APPROVAL_PIN` or `PA_CALL_PIN` is never sent to the assistant
+  in any state; while a PIN is awaited, only PIN-like messages count as attempts. Use a PIN different
+  from `PA_CALL_PIN`.
+- **Messages sent while serve was offline** (older than five minutes) are not executed.
+- **Owner change.** Unpairing, `/lock` or a new pairing stops the poller within five seconds, denies the
+  old chat's pending approvals, drops queued messages unlogged and never resumes the old conversation
+  (a new runtime; session ids are never persisted).
+- **A leaked token.** Anyone with the token can set a webhook and receive every update, including PIN
+  messages and button presses. At the start of each polling generation and on every 409 the service
+  calls `getWebhookInfo`; a webhook URL, or repeated 409s for longer than our own longest poll (a
+  foreign poller), stop Telegram until restart, deny every pending Telegram approval and send a fixed
+  notice to the other channels. It never deletes the webhook, which would hide the compromise.
+  `telegram status` shows whether a webhook is set. Rotation: `telegram unpair`, revoke the token with
+  the bot owner tools, set the new token, restart `serve`, pair again.
+- **Errors.** Network errors back off exponentially (capped at 60 s); 429 `retry_after` is honoured with
+  a cooldown per method class and chat, so button spam cannot block the next approval prompt; a 401 or
+  404 marks the token rejected only when `getMe` confirms it.
+- **Concurrent edits.** The terminal chat and the Telegram assistant can edit the same vault files at
+  the same time without a lock between their tool edits; tool edits can lose updates. The agent's own
+  writes are safe across processes: a note capture is one `O_APPEND` write per entry, task results and
+  outputs go through a unique temp file and an atomic replace (the last writer wins, nothing is torn),
+  a new domain file is created exclusively, and the board and quota use unique temp files (the board
+  also its lock). `tests/test_vault.py` pins concurrent captures and output writes from two processes.
 
 ### 4. Caller authentication
 
@@ -426,11 +553,18 @@ only **reads** about them:
 - Docker deployments must publish ports as `127.0.0.1:PORT:PORT`; a bare `PORT:PORT` bypasses host
   firewalls such as UFW.
 - Request bodies are capped at 8 KiB.
+- Telegram needs no inbound port: `serve` polls `api.telegram.org` over outbound HTTPS (3g).
 
 ### 6. Secrets
 
 Secrets come only from environment variables (`.env`, never committed). `.gitignore` excludes `.env*`,
-`secrets/` and key files. Logs never contain tokens, PINs or full phone numbers.
+`secrets/` and key files. Logs never contain tokens, PINs or full phone numbers. The Discord webhook URL
+and the Telegram bot token are secrets: never logged, hidden from `repr`, never passed to Claude Code.
+The bot token is part of every Bot API URL, so the URL is built only inside the request call; every
+urllib error becomes a `TelegramError` raised after the except block, which carries neither the URL
+nor a chained cause. A logging filter on every handler redacts anything shaped like a bot token from
+messages, arguments, tracebacks and stack traces, and uncaught exceptions in `serve` are logged by type
+only.
 
 ### 7. Cost and noise limits
 
@@ -457,12 +591,17 @@ session. A leading `!` forces the main session.
 | **v1** | Escalation call, session status by phone, acknowledge, simulator | Noise and cost (limits), caller auth |
 | phase 2 | Vault workspace with note capture and note excerpts (done); checked plugins (done); morning brief (done); core skills plugin (done) | Injection from note text (delimited, escaped excerpts; slash allowlist); code execution and injection through plugins (checker, hooks off, Skill allowlist, tripwire); private text in Discord and send storms (counts by default, escaping, once-per-day state under a lock) |
 | phase 3 | Task board with background helpers, approval scopes, completion notices, optional self-delegation, domain memory files with links (done); a read-only `sessions` view of other Claude Code sessions and `hooks snippet` (done); session control documented as not implemented | Helpers starting helpers or writing outside their notes (tool allowlist, write allowlist, scopes); quota drain by unattended work (lower threshold, caps, expiry); injection through delegated text and results (approval, delimiting, no result back into the main session); privacy of other projects' sessions (basename only, opt-in agents source, never forwarded) |
+| phase 4 | Notification layer with routes per kind and privacy by construction (done); Telegram as the owner's channel for notices, chat and approvals (done) | Private text in a third-party channel (counts and inert text, renderer-only sends); notice storms (per-kind limits, async queue); a stolen phone or token (owner binding, PIN for level 3, terminal-only resets, hijack detection) |
 | v2 | Conversational call (speech in/out via a realtime voice pipeline such as Pipecat or LiveKit Agents), optional LLM summary of status; sending to a waiting session only if Claude Code documents a stable mechanism (see SESSION-CONTROL.md) | Injection from session text into the voice model |
 | v3 | Mail reader: classify and summarise mail, write reply **drafts**; approval flow (chat or phone) before sending | Injection from mail content, separate process and credentials |
 | v4 | Voice dashboard (status, numbers, news) | Exposure of a web UI, auth |
 | later | More providers (Telnyx, SIP), more languages, packaging (Docker image with 127.0.0.1 bindings) | — |
 
 ## Open questions
+
+- Telegram: should `serve` run helpers when Telegram approvals exist (revisiting D1)? Not now: tasks
+  from Telegram only queue. A stricter `PA_TELEGRAM_LEVEL2=tap|pin` switch (PIN also for level 2 on
+  Telegram turns) is a candidate if one-tap level 2 proves too weak.
 
 - Project name.
 - Regulatory requirements for phone numbers per country (e.g. address verification) – documented

@@ -376,6 +376,18 @@ class ClaudeSession:
             if proc is not None:
                 self._signal(proc, signal.SIGTERM)
 
+    def interrupt(self) -> None:
+        """Stop the running turn only: SIGTERM to the process group, the session stays usable.
+
+        Unlike abort(), a later send() starts a new process that resumes the conversation
+        (session_id is kept). For a long-lived session where one turn must end, such as
+        "Deny and stop turn" over Telegram.
+        """
+        with self._proc_lock:
+            proc = self._proc
+            if proc is not None:
+                self._signal(proc, signal.SIGTERM)
+
     def kill(self) -> None:
         """SIGKILL the process group, also while close() is still stopping it."""
         with self._proc_lock:

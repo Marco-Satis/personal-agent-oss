@@ -124,9 +124,63 @@ def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipa
     return tuple(networks)
 
 
+TELEGRAM_TOKEN_RE = re.compile(r"^(\d{5,16}):([A-Za-z0-9_-]{30,64})$")
+
+
+def _parse_telegram_token(raw: str | None) -> str | None:
+    """The Telegram bot token (a secret). The error never contains the value."""
+    if not raw:
+        return None
+    if not TELEGRAM_TOKEN_RE.fullmatch(raw):
+        raise ConfigError("PA_TELEGRAM_TOKEN must look like <bot id>:<secret>, exactly as issued for the bot")
+    return raw
+
+
+NOTIFY_KINDS = ("brief", "alert", "approval", "task_done", "info")
+NOTIFY_TARGETS = ("telegram", "discord")
+
+
+def _parse_route(kind: str, raw: str | None) -> tuple[str, ...] | None:
+    """PA_NOTIFY_<KIND>: a comma list of telegram, discord or none. None means: default rule."""
+    if raw is None:
+        return None
+    name = f"PA_NOTIFY_{kind.upper()}"
+    values: list[str] = []
+    for part in raw.split(","):
+        value = part.strip().lower()
+        if not value:
+            continue
+        if value not in NOTIFY_TARGETS + ("none",):
+            raise ConfigError(f"{name} must be a comma-separated list of telegram, discord or none")
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise ConfigError(f"{name} must be a comma-separated list of telegram, discord or none")
+    if "none" in values and len(values) > 1:
+        raise ConfigError(f"{name}: none cannot be combined with a channel")
+    if kind == "approval" and len(values) > 1:
+        raise ConfigError("PA_NOTIFY_APPROVAL takes exactly one value (one delivery path per approval)")
+    return tuple(values)
+
+
+def _validate_routes(routes: tuple[tuple[str, tuple[str, ...]], ...], telegram_token: str | None,
+                     discord_webhook: str | None, public_approval_url: str | None) -> None:
+    for kind, route in routes:
+        name = f"PA_NOTIFY_{kind.upper()}"
+        if "telegram" in route and not telegram_token:
+            raise ConfigError(f"{name}=telegram needs PA_TELEGRAM_TOKEN")
+        if "discord" in route and not discord_webhook:
+            raise ConfigError(f"{name}=discord needs PA_DISCORD_WEBHOOK")
+        if kind == "approval" and route == ("discord",) and not public_approval_url:
+            raise ConfigError("PA_NOTIFY_APPROVAL=discord needs PA_PUBLIC_APPROVAL_URL")
+
+
 _BRIEF_TIME = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 BRIEF_DISCORD_MODES = ("counts", "full")
+BRIEF_TELEGRAM_MODES = ("counts", "full")
 TASK_DISCORD_MODES = ("off", "counts")
+TASK_DETAIL_MODES = ("counts", "title")
+TELEGRAM_TASK_MODES = ("queue", "off")
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off")
 
@@ -219,11 +273,24 @@ class Config:
     task_max_age_h: int = 24         # PA_TASK_MAX_AGE_H: older queued tasks expire
     domain_context_chars: int = 4000  # PA_DOMAIN_CONTEXT_CHARS: domain notes per helper prompt, 0 = none
     sessions_source: str = "hooks"   # PA_SESSIONS_SOURCE: hooks | agents | both (chat `sessions` only)
+    telegram_token: str | None = field(default=None, repr=False)  # PA_TELEGRAM_TOKEN (secret)
+    # PA_NOTIFY_<KIND>, only the kinds set explicitly, e.g. (("alert", ("discord",)),)
+    notify_routes: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    brief_telegram: str = "full"       # PA_BRIEF_TELEGRAM: what the brief shows on Telegram
+    notify_task_detail: str = "counts"  # PA_NOTIFY_TASK_DETAIL: counts | title (id, status, cleaned title)
+    telegram_inbound: bool = True      # PA_TELEGRAM_INBOUND: chat over Telegram (approvals always work)
+    telegram_tasks: str = "queue"      # PA_TELEGRAM_TASKS: queue | off (`task ...` from Telegram)
+    telegram_max_turns_per_hour: int = 30  # PA_TELEGRAM_MAX_TURNS_PER_HOUR: model turns from Telegram
+
+    def route(self, kind: str) -> tuple[str, ...] | None:
+        """The explicit PA_NOTIFY_<KIND> channels, or None for the default rule (notify.resolve_route)."""
+        return dict(self.notify_routes).get(kind)
 
     @property
     def remote_approvals(self) -> bool:
-        """Whether `serve` offers approvals from the phone (notice plus one-time link)."""
-        return bool(self.discord_webhook and self.public_approval_url)
+        """Whether `serve` offers approvals from the phone: Telegram buttons, or a Discord
+        notice plus the one-time link."""
+        return bool(self.discord_webhook and self.public_approval_url) or bool(self.telegram_token)
 
     @property
     def vault_path(self) -> Path:
@@ -310,6 +377,26 @@ class Config:
         sessions_source = (_env("PA_SESSIONS_SOURCE", "hooks") or "hooks").lower()
         if sessions_source not in SESSION_SOURCES:
             raise ConfigError("PA_SESSIONS_SOURCE must be 'hooks', 'agents' or 'both'")
+        discord_webhook = _parse_webhook(_env("PA_DISCORD_WEBHOOK"))
+        public_approval_url = _parse_public_approval_url(_env("PA_PUBLIC_APPROVAL_URL"))
+        telegram_token = _parse_telegram_token(_env("PA_TELEGRAM_TOKEN"))
+        notify_routes = tuple(
+            (kind, route) for kind in NOTIFY_KINDS
+            if (route := _parse_route(kind, _env(f"PA_NOTIFY_{kind.upper()}"))) is not None
+        )
+        _validate_routes(notify_routes, telegram_token, discord_webhook, public_approval_url)
+        brief_telegram = (_env("PA_BRIEF_TELEGRAM", "full") or "full").lower()
+        if brief_telegram not in BRIEF_TELEGRAM_MODES:
+            raise ConfigError("PA_BRIEF_TELEGRAM must be 'counts' or 'full'")
+        notify_task_detail = (_env("PA_NOTIFY_TASK_DETAIL", "counts") or "counts").lower()
+        if notify_task_detail not in TASK_DETAIL_MODES:
+            raise ConfigError("PA_NOTIFY_TASK_DETAIL must be 'counts' or 'title'")
+        telegram_tasks = (_env("PA_TELEGRAM_TASKS", "queue") or "queue").lower()
+        if telegram_tasks not in TELEGRAM_TASK_MODES:
+            raise ConfigError("PA_TELEGRAM_TASKS must be 'queue' or 'off'")
+        telegram_max_turns = _env_int("PA_TELEGRAM_MAX_TURNS_PER_HOUR", 30)
+        if not 1 <= telegram_max_turns <= 600:
+            raise ConfigError("PA_TELEGRAM_MAX_TURNS_PER_HOUR must be between 1 and 600")
 
         return cls(
             state_dir=state_dir,
@@ -340,8 +427,8 @@ class Config:
             quota_stop=quota_stop,
             router_small_model=small_model,
             router_small_max_chars=small_max_chars,
-            discord_webhook=_parse_webhook(_env("PA_DISCORD_WEBHOOK")),
-            public_approval_url=_parse_public_approval_url(_env("PA_PUBLIC_APPROVAL_URL")),
+            discord_webhook=discord_webhook,
+            public_approval_url=public_approval_url,
             approval_pin=approval_pin,
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),
             brief_time=_parse_brief_time(_env("PA_BRIEF_TIME")),
@@ -358,6 +445,13 @@ class Config:
             task_max_age_h=task_max_age_h,
             domain_context_chars=domain_context_chars,
             sessions_source=sessions_source,
+            telegram_token=telegram_token,
+            notify_routes=notify_routes,
+            brief_telegram=brief_telegram,
+            notify_task_detail=notify_task_detail,
+            telegram_inbound=_env_bool("PA_TELEGRAM_INBOUND", True),
+            telegram_tasks=telegram_tasks,
+            telegram_max_turns_per_hour=telegram_max_turns,
         )
 
     def validate_for_serve(self) -> None:
@@ -369,11 +463,13 @@ class Config:
         validate_pin(self.call_pin)
         if self.provider == "twilio" and not (self.public_url or "").startswith("https://"):
             raise ConfigError("PA_PUBLIC_URL must be an https:// URL when using Twilio")
-        if self.public_approval_url and not self.discord_webhook:
-            raise ConfigError("PA_PUBLIC_APPROVAL_URL needs PA_DISCORD_WEBHOOK")
-        if self.brief_time is not None and not self.discord_webhook:
-            raise ConfigError("PA_BRIEF_TIME needs PA_DISCORD_WEBHOOK")
+        if self.public_approval_url and not (self.discord_webhook or self.telegram_token):
+            raise ConfigError("PA_PUBLIC_APPROVAL_URL needs PA_DISCORD_WEBHOOK or PA_TELEGRAM_TOKEN")
+        if self.brief_time is not None and not (self.discord_webhook or self.telegram_token):
+            raise ConfigError("PA_BRIEF_TIME needs PA_DISCORD_WEBHOOK or PA_TELEGRAM_TOKEN")
         if self.remote_approvals:
+            # With Telegram, turns that start in Telegram always ask there: level 3 must be
+            # deniable safely, so the PIN is required as soon as the token is set.
             validate_pin(self.approval_pin, "PA_APPROVAL_PIN")
 
 

@@ -449,7 +449,7 @@ def test_send_without_webhook_exits_2(tmp_path):
     config = make_config(tmp_path, discord_webhook=None)
     notes = []
     assert run_brief(config, True, False, now=NOW, note=notes.append) == 2
-    assert "PA_DISCORD_WEBHOOK" in notes[0]
+    assert notes[0] == "[error] --send needs a brief channel (a paired Telegram bot or PA_DISCORD_WEBHOOK)"
 
 
 def test_run_brief_honours_the_lock(tmp_path):
@@ -513,7 +513,7 @@ def test_partial_failure_resumes_without_reposting(tmp_path):
     assert run_brief(config, True, False, now=NOW, webhook=webhook(opener), note=lambda s: None,
                      sleep=lambda s: None) == 1
     state = load_state(config)[0]
-    assert state["status"] == "failed" and state["chunks_sent"] == 1 and state["attempts"] == 1
+    assert state["status"] == "failed" and state["targets"]["discord"]["chunks_sent"] == 1 and state["attempts"] == 1
     first = opener.texts[0]
     assert run_brief(config, True, False, now=NOW + timedelta(minutes=6), webhook=webhook(opener),
                      note=lambda s: None, sleep=lambda s: None) == 0
@@ -560,13 +560,14 @@ def test_stored_chunks_are_ignored_when_tampered_or_from_another_mode(tmp_path):
                      note=lambda s: None, sleep=lambda s: None) == 1
     stored = config.state_dir / "brief-chunks.json"
     data = json.loads(stored.read_text())
-    digest = load_state(config)[0]["digest"]
-    assert brief_mod.load_chunks(config, "2026-10-18", "full", digest) == data["chunks"]
-    assert brief_mod.load_chunks(config, "2026-10-18", "counts", digest) is None
-    assert brief_mod.load_chunks(config, "2026-10-19", "full", digest) is None
-    data["chunks"][0] = "forged"
+    digest = load_state(config)[0]["targets"]["discord"]["digest"]
+    assert brief_mod.load_chunks(config, "2026-10-18", "discord", "full", digest) == data["targets"]["discord"]["chunks"]
+    assert brief_mod.load_chunks(config, "2026-10-18", "discord", "counts", digest) is None
+    assert brief_mod.load_chunks(config, "2026-10-19", "discord", "full", digest) is None
+    assert brief_mod.load_chunks(config, "2026-10-18", "telegram", "full", digest) is None
+    data["targets"]["discord"]["chunks"][0] = "forged"
     stored.write_text(json.dumps(data))
-    assert brief_mod.load_chunks(config, "2026-10-18", "full", digest) is None
+    assert brief_mod.load_chunks(config, "2026-10-18", "discord", "full", digest) is None
     opener = Opener()
     assert run_brief(config, True, False, now=NOW + timedelta(minutes=6), webhook=webhook(opener),
                      note=lambda s: None, sleep=lambda s: None) == 0

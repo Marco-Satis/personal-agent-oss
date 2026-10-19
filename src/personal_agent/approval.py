@@ -95,6 +95,7 @@ MAX_TOOL_USES = 64         # announced tool calls remembered per turn
 MAX_SOCKET_PATH = 100      # AF_UNIX allows 108 bytes
 POLL_S = 0.5
 CLOSE_JOIN_S = 3.0         # close() waits this long for running decisions to clean up
+MAIN_LABELS = ("chat", "telegram")  # the main scope's trusted label: the terminal chat or serve's Telegram assistant
 YES = ("y", "yes", "j", "ja")
 SKILL_TOOL = "Skill"
 SKILL_CONTEXT = "plugin skill in this turn"
@@ -873,7 +874,10 @@ class ApprovalBroker:
         channel: ApprovalChannel | None = None,
         clock: Callable[[], float] = time.monotonic,
         bind_wait_s: float = BIND_WAIT_S,
+        main_label: str = "chat",
     ) -> None:
+        if main_label not in MAIN_LABELS:
+            raise ValueError("main_label must be 'chat' or 'telegram'")
         self.workdir = Path(workdir)
         self.timeout_s = timeout_s
         self.channel = channel  # replaceable at runtime
@@ -884,9 +888,11 @@ class ApprovalBroker:
         self._cond = threading.Condition()
         self._queue = _PromptQueue(self._cond)
         self._main = ApprovalScope(
-            name="main", kind="main", label="chat", token="", broker=self,
+            name="main", kind="main", label=main_label, token="", broker=self,
             write_deny_parts=(TASK_RESULT_PARTS,),
         )
+        # The Telegram assistant in `serve` never delegates, whatever else is configured.
+        self.delegation_allowed = main_label == "chat"
         self._scopes: dict[str, ApprovalScope] = {"main": self._main}
         self._waiting = 0  # requests of all scopes waiting for the prompt
         self._inflight = 0
@@ -927,6 +933,8 @@ class ApprovalBroker:
         Before start() or after it; afterwards the main MCP config is rewritten
         atomically, so call it before the main session starts.
         """
+        if not self.delegation_allowed:
+            raise RuntimeError("delegation is not available for this assistant")
         self._main.delegation = True
         if self._server is not None and self._dir is not None:
             self._write_main_config()
@@ -1049,6 +1057,7 @@ class ApprovalBroker:
         title: str | None = None,
         domain: str | None = None,
         delegated: bool = False,
+        telegram: bool = False,
     ) -> ApprovalScope:
         """A new helper scope with its own token and MCP config file (mcp-<name>.json)."""
         if self._dir is None or self._server is None or self.closing.is_set():
@@ -1066,6 +1075,8 @@ class ApprovalBroker:
             label += f" ({domain})"
         if delegated:
             label += " · delegated"
+        if telegram:
+            label += " · telegram"  # queued from Telegram: the person sees it in every prompt
         scope = ApprovalScope(
             name=name, kind="helper", label=label, token=secrets.token_urlsafe(32),
             origin=_quoted_title(title), task_id=task_id,
@@ -1382,7 +1393,8 @@ class ApprovalBroker:
     def _decide_delegate(self, scope: ApprovalScope, announced: dict, tool_use_id: str | None,
                          deadline: float, rid: str) -> tuple[Verdict, Level | None, str]:
         """The permission request for delegate_task: deny without asking, or ask the person."""
-        if scope.kind != "main" or not scope.delegation or self.on_delegate is None:
+        if (scope.kind != "main" or not scope.delegation or self.on_delegate is None
+                or not self.delegation_allowed):
             # Without a task service the call could never run: never ask the person for it.
             return Verdict(False, "delegation is off"), None, rid
         with self._cond:
@@ -1417,7 +1429,8 @@ class ApprovalBroker:
     def _delegate(self, scope: ApprovalScope, tool_input: object, sha: object) -> Verdict:
         if not isinstance(tool_input, dict) or not isinstance(sha, str):
             return Verdict(False, "invalid request")
-        if scope.kind != "main" or not scope.delegation or self.on_delegate is None:
+        if (scope.kind != "main" or not scope.delegation or self.on_delegate is None
+                or not self.delegation_allowed):
             return Verdict(False, "delegation is off")
         if self.closing.is_set() or not self._live(scope):
             return Verdict(False, "no active turn")

@@ -1,4 +1,4 @@
-"""Command line: serve, escalate, status, simulate, chat, vault, plugins, brief, hooks."""
+"""Command line: serve, escalate, status, simulate, chat, vault, plugins, brief, hooks, telegram, safety."""
 
 from __future__ import annotations
 
@@ -7,12 +7,9 @@ import json
 import logging
 import os
 import shlex
-import shutil
-import site
 import sys
-import sysconfig
-import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -107,98 +104,10 @@ def _cmd_simulate(config: Config, args: argparse.Namespace) -> int:
             turn = call.handle(speech=entered or None)
 
 
-# "Skill" lets the model use the skills of the checked plugins. The bridge routes every
-# Skill call through the permission tool (HARDENED_SETTINGS), where the broker allows
-# only the loaded plugins' skills; classify() would treat any other Skill route as level 3.
-CHAT_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "Skill")
-
-
-def _inside(path: Path, root: Path) -> bool:
-    return path == root or path.is_relative_to(root)
-
-
-def _python_paths() -> list[Path]:
-    """Where this interpreter loads code from at startup (prefixes, stdlib, site-packages)."""
-    raw: list[str] = [sys.executable, os.path.dirname(sys.executable), sys.prefix, sys.base_prefix,
-                      sys.exec_prefix, sys.base_exec_prefix]
-    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
-        raw.append(sysconfig.get_paths().get(key) or "")
-    try:
-        raw += site.getsitepackages()
-        raw.append(site.getusersitepackages())
-    except (AttributeError, OSError):  # some embedded or venv builds lack these
-        pass
-    return [Path(p) for p in raw if p]
-
-
-STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json",
-                 "tasks.json", "tasks.lock", "tasks-owner.lock")
-DELEGATION_PROMPT = """
-You can queue background work with the tool mcp__pa__delegate_task (text up to 300 characters,
-optional domain). Use it only when the person asks for background work. The person must approve
-it. You never see the result: tell the person the task id; the result appears in
-outputs/tasks/<id>.md and the person decides what to do with it.
-"""
-
-
-def _workdir_problem(config: Config, workdir: Path, config_dir: Path) -> str | None:
-    """Reasons the assistant's working directory (the vault) is unsafe to use.
-
-    The assistant may write inside the workdir (after approval). Nothing that runs
-    code or that the agent trusts may live there: the package, the interpreter and
-    its site-packages (.pth files run at startup), the Claude Code binary and
-    config, the state, the session status files (they can trigger phone calls),
-    the enabled plugins and the broker runtime directory (its MCP config holds the
-    approval token). The vault may live inside the state directory (the default is
-    state_dir/vault) as long as it contains no other state entry.
-    """
-    if not os.path.isabs(sys.executable or ""):
-        return "the Python interpreter path is not absolute"
-    root = workdir.resolve()
-    package = Path(personal_agent.__file__).resolve().parent
-    if _inside(package, root) or _inside(root, package):
-        return "workdir must not contain the personal_agent package"
-    if root == Path("/") or root == Path.home().resolve():
-        return "workdir must not be / or the home directory"
-    if _inside(root, config.status_dir.resolve()):
-        return "workdir must not be inside the session status directory"
-    state = config.state_dir.resolve()
-    from .plugins import core_checkout_root, core_plugin_dir
-
-    core = core_plugin_dir(config)
-    checkout = core_checkout_root(config)
-    inside_checks = [
-        ("the broker runtime directory", state / "run"),
-        ("the plugins directory", state / "plugins"),
-        ("the Claude Code config directory", config_dir.resolve()),
-    ]
-    if core is not None:
-        inside_checks.append(("the core plugin directory", core.resolve()))
-    if checkout is not None:
-        inside_checks.append(("the source checkout of the core plugin", checkout.resolve()))
-    for name, path in inside_checks:
-        if _inside(root, path):
-            return f"vault must not be inside {name}"
-    claude_bin = shutil.which(config.claude_bin)
-    checks: list[tuple[str, Path]] = [
-        ("the Claude Code config directory", config_dir),
-        ("the state directory", config.state_dir),
-        ("the session status directory", config.status_dir),
-        ("the system temp directory", Path(tempfile.gettempdir())),
-        ("the broker runtime directory", config.state_dir / "run"),
-        ("the plugins directory", config.state_dir / "plugins"),
-    ]
-    checks += [(f"the state file {name}", config.state_dir / name) for name in STATE_ENTRIES]
-    if core is not None:
-        checks.append(("the core plugin directory", core))
-    checks += [("the Python interpreter or its packages", p) for p in _python_paths()]
-    if claude_bin:
-        checks.append(("the Claude Code binary", Path(claude_bin)))
-    for name, path in checks:
-        for candidate in {path, path.resolve()}:  # a venv's python is often a symlink out
-            if _inside(candidate.absolute(), root):
-                return f"workdir must not contain {name}"
-    return None
+# Moved to assistant.py (shared with serve's Telegram assistant); the names stay importable here.
+from .assistant import CHAT_TOOLS, DELEGATION_PROMPT, STATE_ENTRIES  # noqa: E402,F401
+from .assistant import _inside, _python_paths  # noqa: E402,F401
+from .assistant import workdir_problem as _workdir_problem  # noqa: E402
 
 
 def _cmd_vault(config: Config, args: argparse.Namespace) -> int:
@@ -324,83 +233,58 @@ def _cmd_brief(config: Config, args: argparse.Namespace) -> int:
 
 def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
     """Talk to the assistant in the terminal. Writing asks for your approval first."""
-    from .approval import PERMISSION_TOOL, ApprovalBroker, ConsoleChannel
+    from .approval import PERMISSION_TOOL, ConsoleChannel
     from .approval_server import SERVER_NAME
-    from .bridge import DEFAULT_TURN_TIMEOUT_S, DELEGATE_TOOL, BridgeConfig, BridgeError, ClaudeSession
+    from .assistant import AssistantError, finish_assistant, prepare_assistant, reply_lines
+    from .bridge import BridgeError
     from .console import ChatConsole
-    from .domains import Domains
-    from .plugins import invocable, load_for_session
-    from .quota import QuotaGuard
     from .remote import RemoteChannel, local_opener
-    from .router import Router, RouterConfig, SafetyLatch
-    from .vault import HELPER_SYSTEM_PROMPT, VAULT_SYSTEM_PROMPT, Vault, VaultError
+    from .vault import HELPER_SYSTEM_PROMPT
 
     remote = bool(getattr(args, "remote_approvals", False))
     if remote and not config.api_token:
         print("[error] --remote-approvals needs PA_API_TOKEN (the same as for serve)", file=sys.stderr)
         return 2
-    workdir, config_dir = config.bridge_paths()
-    problem = _workdir_problem(config, workdir, config_dir)
-    if problem:
-        print(f"[error] {problem}", file=sys.stderr)
-        return 2
-    root = workdir.resolve()
-    vault = Vault(workdir, config.language)
-    try:
-        created = vault.init().created
-    except VaultError as exc:
-        print(f"[warning] {exc}", file=sys.stderr)
-        created = ()
-    if created:
-        print(f"[vault: created {', '.join(created)}]")
-    plugins, warnings = load_for_session(config)  # checked on every start
-    for warning in warnings:
-        print(f"[{warning}]")
-    plugin_names = tuple(p.name for p in plugins)
-    allowed_skills = invocable(plugins)
-    if plugins:
-        print(f"[plugins: {', '.join(plugin_names)}]")
-
     console_lock = threading.Lock()
     console = ChatConsole(console_lock)
-    broker = ApprovalBroker(workdir, config.approval_timeout_s)
-    broker.allowed_skills = frozenset(allowed_skills)
 
-    def stop() -> bool:
-        # Only the broker's end stops every prompt; each prompt's own scope decides the rest.
-        return broker.closing.is_set()
+    def make_channel(broker: object) -> object:
+        def stop() -> bool:
+            # Only the broker's end stops every prompt; each prompt's own scope decides the rest.
+            return broker.closing.is_set()  # type: ignore[attr-defined]
 
-    if remote:
-        assert config.api_token
-        try:
-            with local_opener()(_local_url(config, "/healthz"), timeout=3) as response:
-                response.read(64)
-        except (OSError, ValueError):
-            print("[warning] `personal-agent serve` is not reachable: remote approvals will be denied")
-        broker.channel = RemoteChannel(_local_url(config, ""), config.api_token, console_lock, stop=stop,
-                                       stop_for=broker.request_stopped)
-    else:
-        broker.channel = ConsoleChannel(console_lock, stop=stop, stop_for=broker.request_stopped, console=console,
-                                        preempted=broker.request_preempted)
-    runtime_parent: Path | None = config.state_dir / "run"
-    if _inside(runtime_parent.resolve(), root):
-        runtime_parent = None
+        if remote:
+            assert config.api_token
+            try:
+                with local_opener()(_local_url(config, "/healthz"), timeout=3) as response:
+                    response.read(64)
+            except (OSError, ValueError):
+                print("[warning] `personal-agent serve` is not reachable: remote approvals will be denied")
+            return RemoteChannel(_local_url(config, ""), config.api_token, console_lock, stop=stop,
+                                 stop_for=broker.request_stopped)  # type: ignore[attr-defined]
+        return ConsoleChannel(console_lock, stop=stop, stop_for=broker.request_stopped,  # type: ignore[attr-defined]
+                              console=console, preempted=broker.request_preempted)  # type: ignore[attr-defined]
+
     try:
-        mcp_path = broker.start(runtime_parent)
-    except OSError as exc:
-        print(f"[error] could not start the approval service: {type(exc).__name__}", file=sys.stderr)
-        return 1
-    if broker.runtime_dir is None or _inside(broker.runtime_dir.resolve(), root):
-        broker.close()
-        print("[error] the approval runtime directory must not be inside the workdir", file=sys.stderr)
-        return 2
-    mcp_timeout = {"MCP_TOOL_TIMEOUT": str((config.approval_timeout_s + 30) * 1000)}
-    latch = SafetyLatch()
-    guard = QuotaGuard(config.quota_stop, config.state_dir / "quota.json")
-    domains = Domains(vault)
+        parts = prepare_assistant(config, label="chat", channel=make_channel, note=print,
+                                  warn=lambda line: print(line, file=sys.stderr))
+    except AssistantError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return exc.code
+    broker, workdir, config_dir = parts.broker, parts.workdir, parts.config_dir
+    shared_stop = parts.latch.reason
+    if shared_stop:
+        # A safety stop of another session (e.g. serve's Telegram assistant) holds for this
+        # chat too. Only the terminal lifts it, after an explicit confirmation.
+        print(f"[safety] the assistant was stopped earlier ({shared_stop})")
+        if _confirm("Clear this stop for every session and continue? [y/N] "):
+            parts.latch.clear()
+            print("[safety stop cleared]")
+        else:
+            print("[turns stay refused; `personal-agent safety clear` lifts the stop]")
     coordinator, notifier, service = _start_tasks(
-        config, args, console, broker, guard, latch, vault, workdir, config_dir, mcp_timeout,
-        HELPER_SYSTEM_PROMPT, PERMISSION_TOOL, SERVER_NAME, domains,
+        config, args, console, broker, parts.guard, parts.latch, parts.vault, workdir, config_dir,
+        parts.mcp_timeout, HELPER_SYSTEM_PROMPT, PERMISSION_TOOL, SERVER_NAME, parts.domains,
     )
     # Delegation is offered (MCP flag, system prompt, init tripwire) only when the task
     # service really runs: otherwise the person would approve a call that can never run.
@@ -414,70 +298,18 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
             notifier.close()
 
     try:
-        if delegation:
-            broker.on_delegate = service.delegate
-            broker.enable_delegation()  # rewrites mcp.json before the main session starts
-        # Outside the vault and 0600. Auto-loading of the vault's CLAUDE.md under
-        # --restricted is not verified, so the layout rules travel this way.
-        system_prompt = broker.write_runtime_file(
-            "vault-system-prompt.md", VAULT_SYSTEM_PROMPT + (DELEGATION_PROMPT if delegation else ""))
-    except OSError as exc:
+        runtime = finish_assistant(
+            parts, tasks=service, delegation=delegation, model=args.model or config.claude_model,
+            # Only this typed tier-1 command may read `claude agents --json` (PA_SESSIONS_SOURCE).
+            sessions=lambda: session_overview(config.status_dir, config.status_max_age_min,
+                                              config.sessions_source, config.claude_bin),
+        )
+    except AssistantError as exc:
         close_tasks()
         broker.close()
-        print(f"[error] could not write the system prompt: {type(exc).__name__}", file=sys.stderr)
-        return 1
-
-    model = args.model or config.claude_model
-    main_session = ClaudeSession(
-        BridgeConfig(
-            workdir=workdir,
-            config_dir=config_dir,
-            claude_bin=config.claude_bin,
-            model=model,
-            tools=CHAT_TOOLS,
-            mcp_config=mcp_path,
-            permission_tool=PERMISSION_TOOL,
-            system_prompt_file=system_prompt,
-            plugin_dirs=tuple(p.path for p in plugins),
-            expected_plugins=plugin_names,
-            expected_mcp=(SERVER_NAME,),
-            allowed_skills=allowed_skills,
-            oauth_token=config.claude_oauth_token,
-            extra_tools=(DELEGATE_TOOL,) if delegation else (),
-        ),
-        extra_env=dict(mcp_timeout),
-        turn_timeout_s=max(DEFAULT_TURN_TIMEOUT_S, config.approval_timeout_s + 120),
-    )
-    # Tier 2: no tools at all, no MCP servers, no permission tool, no plugins. Starts on first use.
-    small_session = None
-    if config.router_small_model:
-        small_session = ClaudeSession(
-            BridgeConfig(
-                workdir=workdir,
-                config_dir=config_dir,
-                claude_bin=config.claude_bin,
-                model=config.router_small_model,
-                tools=(),
-                oauth_token=config.claude_oauth_token,
-            )
-        )
-    router = Router(
-        main_session,
-        small_session,
-        guard,
-        RouterConfig(config.router_small_model, config.router_small_max_chars),
-        statuses=lambda: read_statuses(config.status_dir, config.status_max_age_min),
-        vault=vault,
-        context_chars=config.vault_context_chars,
-        slash_commands=frozenset("/" + name for name in allowed_skills),
-        on_context=broker.set_turn_context,
-        latch=latch,
-        tasks=service,
-        domains=domains,
-        # Only this typed tier-1 command may read `claude agents --json` (PA_SESSIONS_SOURCE).
-        sessions=lambda: session_overview(config.status_dir, config.status_max_age_min,
-                                          config.sessions_source, config.claude_bin),
-    )
+        print(f"[error] {exc}", file=sys.stderr)
+        return exc.code
+    router = runtime.router
     say = console.say
 
     def on_event(event: dict) -> None:
@@ -521,26 +353,8 @@ def _cmd_chat(config: Config, args: argparse.Namespace) -> int:
             if error is not None:
                 say(f"[error] {error}")
                 continue
-            if reply.refused:
-                say(f"[{'safety' if reply.safety else 'quota'}] {reply.text}")
-                continue
-            if reply.context_count:
-                say(f"[context: {reply.context_count} notes]")
-            say(f"agent[{reply.tier}]> {reply.text}")
-            result = reply.result
-            if result is None:
-                continue
-            for denial in result.denials:
-                name = denial.get("tool_name") if isinstance(denial, dict) else None
-                say(f"[not approved: {clean_text(name or 'unknown tool', 80)}]")
-            if result.is_error:
-                say(f"[turn ended with an error ({result.subtype})]")
-                if "logged in" in result.text.lower():
-                    say(
-                        f"[the assistant uses its own Claude Code config in {config_dir}: "
-                        "run `claude setup-token` once and set CLAUDE_CODE_OAUTH_TOKEN, "
-                        "or point PA_CLAUDE_CONFIG_DIR at an existing login]"
-                    )
+            for out_line in reply_lines(reply, config_dir):
+                say(out_line)
     except KeyboardInterrupt:
         return 130
     finally:
@@ -571,7 +385,7 @@ def _start_tasks(config: Config, args: argparse.Namespace, console: object, brok
         helper_turn_timeout,
         notice_line,
     )
-    from .remote import DiscordWebhook
+    from .notify import Notifier, NotifierPost, resolve_route
     from .tasks import TaskBoard, TaskError
 
     if not config.tasks_enabled:
@@ -583,11 +397,16 @@ def _start_tasks(config: Config, args: argparse.Namespace, console: object, brok
         return None, None, None
     board = TaskBoard(config.state_dir)
     notifier = None
-    if config.task_discord == "counts":
-        if config.discord_webhook:
-            notifier = TaskNotifier(DiscordWebhook(config.discord_webhook), board)
-        else:
-            console.say("[warning] PA_TASK_DISCORD=counts needs PA_DISCORD_WEBHOOK; task notices stay in the chat")  # type: ignore[attr-defined]
+    # Task notices outside the chat go through the notification layer (PA_NOTIFY_TASK_DONE;
+    # by default Discord only with PA_TASK_DISCORD=counts). Sends are synchronous here, on
+    # the TaskNotifier's own thread.
+    messenger = Notifier.from_config(config, run_thread=False)
+    # With a Telegram token the notifier is built even while the bot is unpaired: the channel
+    # is resolved per notice, so a pairing made while this chat runs is picked up.
+    if config.telegram_token or resolve_route(config, "task_done", messenger.telegram_ready()):
+        notifier = TaskNotifier(NotifierPost(messenger, "task_done"), board, detail=config.notify_task_detail)
+    elif config.task_discord == "counts" and not config.discord_webhook:
+        console.say("[warning] PA_TASK_DISCORD=counts needs PA_DISCORD_WEBHOOK; task notices stay in the chat")  # type: ignore[attr-defined]
 
     def notify(event: object) -> None:
         console.notice(notice_line(event))  # type: ignore[arg-type, attr-defined]
@@ -674,6 +493,83 @@ def _cmd_hooks(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_telegram(config: Config, args: argparse.Namespace) -> int:
+    """Pair, inspect or unpair the Telegram bot. Never prints the bot token."""
+    from .telegram import run_pairing
+
+    command = args.telegram_command
+    if not config.telegram_token:
+        print("[error] PA_TELEGRAM_TOKEN is not set", file=sys.stderr)
+        return 2
+    if command == "pair":
+        return run_pairing(config, force=args.force, yes=args.yes, print_code=args.print_code)
+    if command == "unpair":
+        return _telegram_unpair(config)
+    return _telegram_status(config, args)
+
+
+def _telegram_unpair(config: Config) -> int:
+    from .telegram import OwnerStore, PairingStore, TelegramClient
+
+    client = TelegramClient.from_config(config)
+    removed = OwnerStore(config.state_dir, client.bot_id).remove()
+    PairingStore(config.state_dir, client.bot_id).remove()
+    print("unpaired; a running serve stops polling within 5 seconds" if removed else "not paired")
+    return 0
+
+
+def _telegram_status(config: Config, args: argparse.Namespace) -> int:
+    from .notify import KINDS, resolve_route
+    from .remote import PinLockout
+    from .telegram import OwnerStore, PairingStore, PollLock, TelegramClient, TelegramError
+
+    client = TelegramClient.from_config(config)
+    lockout = PinLockout(config.state_dir)
+    if args.clear_lock:
+        lockout.clear()
+        print("PIN lockouts cleared (a running serve picks this up at once)")
+    print(f"token: set (bot id {client.bot_id})")
+    if not args.offline:
+        try:
+            me = client.get_me()
+            username = me.get("username") if isinstance(me.get("username"), str) else "?"
+            print(f"bot: @{clean_text(username, 40)}")
+            hook = client.get_webhook_info().get("url")
+            print(f"webhook set: {'yes (another client may receive the updates; revoke the token)' if hook else 'no'}")
+        except TelegramError as exc:
+            print(f"bot: not reachable ({exc})")
+    owner = OwnerStore(config.state_dir, client.bot_id).current()
+    if owner is None:
+        print("paired: no (personal-agent telegram pair)")
+    else:
+        paired_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(owner.paired_at))
+        print(f"paired: yes (chat {owner.masked_chat()}, since {paired_at})")
+    pending = PairingStore(config.state_dir, client.bot_id).load()
+    if pending is not None:
+        print(f"pending pairing code: expires {time.strftime('%H:%M:%S', time.localtime(pending['expires_at']))}")
+    print(f"poller running: {'yes' if PollLock(config.state_dir).held_elsewhere() else 'no'}")
+    wrong, disabled = lockout.status()
+    print(f"wrong approval PINs (24 h): {wrong}{' · level-3 remote approvals disabled' if disabled else ''}")
+    ready = owner is not None
+    for kind in KINDS:
+        route = resolve_route(config, kind, ready)
+        print(f"notices {kind}: {', '.join(route) if route else 'none'}")
+    return 0
+
+
+def _cmd_safety(config: Config, args: argparse.Namespace) -> int:
+    """Show or clear the safety stop that every session of this agent shares."""
+    from .router import clear_shared_stop, read_shared_stop
+
+    if args.safety_command == "clear":
+        print("safety stop cleared; restart serve and open chats (a running process keeps its stop)" if clear_shared_stop(config.state_dir)
+              else "no safety stop is set")
+        return 0
+    reason = read_shared_stop(config.state_dir)
+    print(f"safety stop: {reason}" if reason else "no safety stop is set")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="personal-agent", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -698,7 +594,8 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--remote-approvals",
         action="store_true",
-        help="ask for approvals through a Discord notice and a one-time link (needs `serve` running)",
+        help="ask for approvals on your phone through `serve`: Telegram buttons when the bot is paired, "
+             "else a Discord notice and a one-time link (PA_NOTIFY_APPROVAL)",
     )
 
     vault = sub.add_parser("vault", help="the Markdown vault the assistant works in")
@@ -719,7 +616,9 @@ def build_parser() -> argparse.ArgumentParser:
     disable.add_argument("name")
 
     brief = sub.add_parser("brief", help="build today's brief (no model) and write it to the vault")
-    brief.add_argument("--send", action="store_true", help="post it to PA_DISCORD_WEBHOOK")
+    brief.add_argument("--send", action="store_true",
+                       help="send it to the brief channels (PA_NOTIFY_BRIEF; by default the paired Telegram bot, "
+                            "else PA_DISCORD_WEBHOOK)")
     brief.add_argument("--polish", action="store_true",
                        help="let the small model rewrite the text once per day (respects the quota guard)")
     brief.add_argument("--quiet", action="store_true", help="do not print the brief")
@@ -727,6 +626,23 @@ def build_parser() -> argparse.ArgumentParser:
     hooks = sub.add_parser("hooks", help="the status hook for your Claude Code sessions")
     hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
     hooks_sub.add_parser("snippet", help="print the settings.json snippet (never edits any settings file)")
+
+    telegram = sub.add_parser("telegram", help="the Telegram bot: pair, status, unpair")
+    telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
+    pair = telegram_sub.add_parser("pair", help="print a one-time code and bind the chat that sends it")
+    pair.add_argument("--force", action="store_true", help="replace an existing pairing")
+    pair.add_argument("--yes", action="store_true", help="bind without asking (no terminal to confirm)")
+    pair.add_argument("--print-code", action="store_true",
+                      help="print the code even when stdout is not a terminal (it may end up in logs)")
+    status = telegram_sub.add_parser("status", help="token, pairing, poller and notice routes (never the token)")
+    status.add_argument("--offline", action="store_true", help="do not contact Telegram")
+    status.add_argument("--clear-lock", action="store_true", help="reset the PIN lockout counter")
+    telegram_sub.add_parser("unpair", help="forget the paired chat (a running serve stops polling)")
+
+    safety = sub.add_parser("safety", help="the safety stop shared by every session of this agent")
+    safety_sub = safety.add_subparsers(dest="safety_command", required=True)
+    safety_sub.add_parser("status", help="show the safety stop")
+    safety_sub.add_parser("clear", help="clear the safety stop (terminal only)")
     return parser
 
 
@@ -740,6 +656,8 @@ COMMANDS = {
     "plugins": _cmd_plugins,
     "brief": _cmd_brief,
     "hooks": _cmd_hooks,
+    "telegram": _cmd_telegram,
+    "safety": _cmd_safety,
 }
 
 
@@ -749,8 +667,12 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    from .telegram import install_redaction
+
+    install_redaction()  # bot tokens never reach a log line, tracebacks included
     try:
         config = Config.from_env()
+        install_redaction(config)
         return COMMANDS[args.command](config, args)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

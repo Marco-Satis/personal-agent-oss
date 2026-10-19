@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .bridge import DEFAULT_TURN_TIMEOUT_S, BridgeConfig, BridgeError
 from .domains import Domains
+from .notify import DiscordTarget, task_counts_notice, task_detail_notice
 from .quota import QuotaGuard
 from .router import PaidUsageStop, SafetyLatch, SafetyStop, UnsafeInput, guarded_send
 from .status import clean_text
@@ -49,7 +50,7 @@ from .vault import Vault, VaultError, valid_domain
 if TYPE_CHECKING:
     from .approval import ApprovalBroker, ApprovalScope
     from .bridge import ClaudeSession
-    from .remote import DiscordWebhook
+    from .notify import Target
     from .tasks import Command
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ class TaskEvent:
     result: str | None
     error: str | None
     counts: dict[str, int] = field(default_factory=dict)
+    title: str | None = None  # done/failed/cancelled: only for PA_NOTIFY_TASK_DETAIL=title notices
 
 
 def notice_line(event: TaskEvent) -> str:
@@ -355,7 +357,7 @@ class Coordinator:
             if task.status != "running" or task.id in known:
                 continue
             if self.board.finish(task.id, "failed", error=ORPHANED, denials=task.denials) is not None:
-                self._notify(TaskEvent(task.id, "failed", None, ORPHANED, self._counts()))
+                self._notify(TaskEvent(task.id, "failed", None, ORPHANED, self._counts(), title=task.title))
 
     def _claim(self) -> None:
         while not self._stop.is_set():
@@ -378,6 +380,11 @@ class Coordinator:
             if task is None:
                 return
             self._notified = None
+            if task.origin == "telegram":
+                # The console runs (and approves) work it did not type: say where it came from.
+                self._notify(TaskEvent(task.id, "notice", None,
+                                       f"task {task.id} was queued from Telegram: {clean_text(task.title, 60)}",
+                                       self._counts()))
             self._start_worker(task)
 
     def _start_worker(self, task: Task) -> None:
@@ -438,8 +445,8 @@ class Coordinator:
                     log.warning("task %s: could not record the result (%s)", task.id, type(exc).__name__)
                     with self._lock:
                         self._pending_finish[task.id] = outcome
-                event =TaskEvent(task.id, status, result_path(task.id) if result else None,
-                                  None if error is None else clean_error(error), self._counts())
+                event = TaskEvent(task.id, status, result_path(task.id) if result else None,
+                                  None if error is None else clean_error(error), self._counts(), title=task.title)
             with self._lock:
                 self._workers.pop(task.id, None)
             if event is not None:
@@ -454,7 +461,7 @@ class Coordinator:
         try:
             scope = self.broker.open_scope(
                 f"task-{task.id}", kind="helper", task_id=task.id, title=task.title,
-                domain=task.domain, delegated=task.delegated,
+                domain=task.domain, delegated=task.delegated, telegram=task.origin == "telegram",
             )
         except RuntimeError:
             return ("failed", "could not open an approval scope", None, None, 0), False
@@ -472,7 +479,7 @@ class Coordinator:
                 return ("failed", f"stopped: {check.reason}", None, None, 0), False
             if new is not None and new.status == "cancelled":
                 # The person cancelled it while it was being claimed.
-                self._notify(TaskEvent(task.id, "cancelled", None, None, self._counts()))
+                self._notify(TaskEvent(task.id, "cancelled", None, None, self._counts(), title=task.title))
                 return None, False
             self._notify_waiting(check.reason)
             return None, False
@@ -572,8 +579,13 @@ class TaskService:
 
     def __init__(self, board: TaskBoard, coordinator: Coordinator | None, latch: SafetyLatch,
                  vault: Vault | None = None, domains: Domains | None = None,
-                 standby: Coordinator | None = None) -> None:
+                 standby: Coordinator | None = None, *,
+                 runner_hint: str = "it runs in the other open chat; its approvals appear there",
+                 origin: str = "chat", allow_add: bool = True) -> None:
         self.board = board
+        self.runner_hint = runner_hint
+        self.origin = origin        # "telegram" in serve: the console sees where a task came from
+        self.allow_add = allow_add  # False: PA_TELEGRAM_TASKS=off
         self.coordinator = coordinator
         self.latch = latch
         self.vault = vault
@@ -633,7 +645,7 @@ class TaskService:
         if reason:
             line += f" · tasks are paused: {reason}"
         if self.coordinator is None:
-            line += " · it runs in the other open chat; its approvals appear there"
+            line += f" · {self.runner_hint}"
         return line
 
     def delegate(self, text: str, domain: str | None) -> str:
@@ -650,7 +662,9 @@ class TaskService:
     def _command(self, command: "Command") -> tuple[str, bool]:
         try:
             if command.kind == "task_add":
-                return self.add(command.arg, command.domain)[1], False
+                if not self.allow_add:
+                    return "tasks from Telegram are off (PA_TELEGRAM_TASKS=off)", True
+                return self.add(command.arg, command.domain, origin=self.origin)[1], False
             if command.kind == "tasks":
                 return self.list_text(), False
             if command.kind == "task_show":
@@ -733,22 +747,34 @@ def _preview(text: str, max_lines: int = 15, max_chars: int = 1200) -> str:
     return preview + ("\n…(cut)" if cut else "")
 
 
-# --- Discord: counts only -----------------------------------------------------------------
+# --- notices outside the chat: counts by default -------------------------------------------
+
+MAX_DETAILS = 10
 
 
 class TaskNotifier:
-    """Posts task counts to the Discord webhook, at most once per interval. Never ids,
-    titles, domains, errors or paths: the webhook channel is outside the person's machine."""
+    """Posts task counts through a notice channel, at most once per interval.
 
-    def __init__(self, webhook: "DiscordWebhook", board: TaskBoard | None = None,
+    By default (detail="counts") never ids, titles, domains, errors or paths: the channel
+    is outside the person's machine. With detail="title" (PA_NOTIFY_TASK_DETAIL) up to ten
+    lines per notice add the task id, its status and the cleaned title, never more.
+
+    `webhook` is anything with `.post(text) -> bool` (a Discord webhook); a
+    notify.NotifierPost also has `.post_build(renderer)`, so the title is made inert
+    for each channel separately.
+    """
+
+    def __init__(self, webhook: object, board: TaskBoard | None = None,
                  min_interval_s: float = NOTICE_INTERVAL_S, clock: Callable[[], float] = time.monotonic,
-                 run_thread: bool = True) -> None:
+                 run_thread: bool = True, detail: str = "counts") -> None:
         self.webhook = webhook
         self.board = board
         self.min_interval_s = min_interval_s
         self.clock = clock
+        self.detail = detail
         self._lock = threading.Lock()
         self._pending = {"done": 0, "failed": 0, "cancelled": 0}
+        self._details: list[tuple[str, str, str | None]] = []
         self._last_post: float | None = None
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -762,9 +788,11 @@ class TaskNotifier:
             return
         with self._lock:
             self._pending[event.status] += 1
+            if self.detail == "title" and len(self._details) < MAX_DETAILS:
+                self._details.append((event.task_id, event.status, event.title))
         self._wake.set()
 
-    def text(self) -> str | None:
+    def _counts_notice(self) -> Callable[["Target | None"], str] | None:
         with self._lock:
             pending = dict(self._pending)
         if not any(pending.values()):
@@ -777,24 +805,41 @@ class TaskNotifier:
                 queued = counts.get("queued", 0) + counts.get("waiting", 0)
             except TaskError:
                 pass
-        return (f"Tasks: {pending['done']} done, {pending['failed']} failed, {pending['cancelled']} cancelled"
-                f" · {running} running, {queued} queued")
+        return task_counts_notice(pending["done"], pending["failed"], pending["cancelled"], running, queued)
+
+    def text(self) -> str | None:
+        """The counts line (what a counts-only notice says)."""
+        notice = self._counts_notice()
+        return None if notice is None else notice(None)
+
+    def _deliver(self, build: Callable[["Target"], str]) -> bool:
+        post_build = getattr(self.webhook, "post_build", None)
+        if post_build is not None:
+            return bool(post_build(build))
+        return bool(self.webhook.post(build(DiscordTarget(self.webhook))))  # type: ignore[attr-defined]
 
     def flush(self, force: bool = False) -> bool:
         """Post pending counts if the interval allows (or force). True when something was posted."""
         now = self.clock()
         if not force and self._last_post is not None and now - self._last_post < self.min_interval_s:
             return False
-        text = self.text()
-        if text is None:
+        counts = self._counts_notice()
+        if counts is None:
             return False
         with self._lock:
             sent = dict(self._pending)
-        if not self.webhook.post(text):
+            details = list(self._details)
+        lines = [task_detail_notice(task_id, status, title) for task_id, status, title in details]
+
+        def build(target: "Target") -> str:
+            return "\n".join([counts(target), *(line(target) for line in lines)])
+
+        if not self._deliver(build):
             return False  # counts are kept for the next post
         with self._lock:
             for key, value in sent.items():
                 self._pending[key] -= value
+            del self._details[:len(details)]
         self._last_post = now
         return True
 

@@ -422,3 +422,41 @@ def test_domain_notes_stay_out_of_context_and_brief(tmp_path):
     assert [t.text for t in tasks] == ["real boiler task"]
     excerpts = v.select_context("boiler task", 3000)
     assert excerpts and all(not e.path.startswith("wiki/domains") for e in excerpts)
+
+
+WRITER = r"""
+import sys
+from datetime import datetime
+from personal_agent.vault import Vault
+
+root, tag = sys.argv[1], sys.argv[2]
+vault = Vault(root, clock=lambda: datetime(2026, 10, 18, 9, 30).timestamp())
+for i in range(150):
+    vault.capture(f"note {tag} {i}")
+    vault.write_output("race.md", f"{tag}\n" * 2000)
+"""
+
+
+def test_own_writes_are_safe_across_processes(vault, tmp_path):
+    """The chat and serve write the vault at the same time: captures and outputs never get lost or torn."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    vault.capture("first")  # the inbox header exists before the race
+    script = tmp_path / "writer.py"
+    script.write_text(WRITER)
+    env = {**os.environ, "PYTHONPATH": str(Path(vault_mod.__file__).resolve().parent.parent)}
+    procs = [subprocess.Popen([sys.executable, str(script), str(vault.root), tag], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for tag in ("A", "B")]
+    for proc in procs:
+        _, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err[-500:]  # never "could not write the output"
+    lines = (vault.root / "raw" / "inbox-2026-10-18.md").read_text().splitlines()
+    entries = [line for line in lines if line.startswith("- ")]
+    assert len(entries) == 301 and all(line.startswith("- 09:30 ") for line in entries)
+    for tag in ("A", "B"):
+        assert sorted(line.split()[-1] for line in entries if f"note {tag} " in line) == sorted(
+            str(i) for i in range(150))
+    assert (vault.root / "outputs" / "race.md").read_text() in ("A\n" * 2000, "B\n" * 2000)
+    assert [p.name for p in (vault.root / "outputs").iterdir() if p.name.endswith(".tmp")] == []

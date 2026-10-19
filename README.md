@@ -18,6 +18,8 @@ dashboard are on the [roadmap](docs/CONCEPT.md#roadmap).
   - **9 / "goodbye"** – hang up
 - Built-in limits keep it quiet: only critical events call, one call per key per hour, minimum interval,
   daily cap, quiet hours.
+- Optional [Telegram bot](#telegram): notices, approvals with buttons and a chat with the assistant from
+  your phone, bound to your account only.
 
 English and German voice prompts are included.
 
@@ -132,7 +134,7 @@ source checkout the core plugin was found in (the default `$PA_STATE_DIR/vault` 
 | `PA_TASK_TIMEOUT_S` | `900` | a helper running longer is stopped (60–3600) |
 | `PA_TASK_QUOTA_STOP` | `min(0.8, PA_QUOTA_STOP)` | helpers stop starting at this share of a usage window, leaving headroom for the chat |
 | `PA_TASK_MAX_AGE_H` | `24` | queued tasks older than this expire instead of starting (1–720) |
-| `PA_TASK_DISCORD` | `off` | `counts`: post task counts (never content) to `PA_DISCORD_WEBHOOK` |
+| `PA_TASK_DISCORD` | `off` | `counts`: post task counts (never content) to `PA_DISCORD_WEBHOOK` (see [Notifications](#notifications)) |
 | `PA_TASK_DELEGATION` | `off` | `on`: the main assistant may queue tasks itself, each with your approval |
 | `PA_DOMAIN_CONTEXT_CHARS` | `4000` | character budget for domain notes attached to a helper's message (0–8000, `0` attaches none) |
 | `PA_SESSIONS_SOURCE` | `hooks` | where `sessions` looks: `hooks` (status files), `agents` (`claude agents --json`) or `both`; see [below](#connect-your-claude-code-sessions) |
@@ -295,9 +297,18 @@ or others; `enable` tightens a state folder it finds group-writable.
 
 ### Approvals from your phone
 
-Not at the terminal? `personal-agent chat --remote-approvals` sends each approval to your phone instead:
-a short Discord notice with the tool name, the level and a one-time link. The link opens a small page
-served by `personal-agent serve`, where you allow or deny. The notice never contains the tool input.
+Not at the terminal? `personal-agent chat --remote-approvals` sends each approval to your phone instead,
+through the running `personal-agent serve`:
+
+- With a paired [Telegram bot](#telegram) (the default when it is ready): a message with the tool name,
+  the level, where the request comes from and **Approve** / **Deny** buttons. Level 3 also needs your
+  approval PIN as the next message. With `PA_PUBLIC_APPROVAL_URL` set, the message also carries a review
+  link to the one-time page, where you can see the request before you decide.
+- Otherwise, with Discord: a short notice with the tool name, the level and a one-time link. The link
+  opens a small page served by `personal-agent serve`, where you allow or deny.
+
+Neither ever contains the tool input. `PA_NOTIFY_APPROVAL=telegram|discord|none` picks the path
+explicitly. The Discord setup:
 
 1. Create a Discord webhook for a private channel and set `PA_DISCORD_WEBHOOK` (treat it as a secret).
 2. Set `PA_PUBLIC_APPROVAL_URL` to the address your phone uses to reach the server, for example your
@@ -307,15 +318,15 @@ served by `personal-agent serve`, where you allow or deny. The notice never cont
    page; three wrong PINs deny the request.
 4. Run `personal-agent serve` (same `PA_API_TOKEN`), then `personal-agent chat --remote-approvals`.
 
-Each link works once and expires shortly before `PA_APPROVAL_TIMEOUT_S`. Expired, cancelled or
-unanswered requests are denied. At most five requests may be pending and at most five notices are sent
-per ten minutes.
+Each link and each button works once and expires shortly before `PA_APPROVAL_TIMEOUT_S`. Expired,
+cancelled or unanswered requests are denied. At most five requests may be pending and at most five
+notices or prompts are sent per ten minutes (console approvals and Telegram turns together).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PA_DISCORD_WEBHOOK` | – | Discord webhook URL (`https://discord.com/api/webhooks/...`), never logged |
 | `PA_PUBLIC_APPROVAL_URL` | – | base URL of the approval page, `https://` is added if missing |
-| `PA_APPROVAL_PIN` | – | PIN for level-3 approvals on the page, required when remote approvals are set |
+| `PA_APPROVAL_PIN` | – | PIN for level-3 approvals on the page and over Telegram, required when remote approvals or `PA_TELEGRAM_TOKEN` are set; choose one that differs from `PA_CALL_PIN` |
 | `PA_TRUSTED_CLIENTS` | – | extra private networks allowed on `/escalate` and `/internal/`, e.g. `172.17.0.1/32` when `serve` runs in a container (host clients then arrive from the bridge gateway and otherwise get 404) |
 
 ### Morning brief
@@ -327,19 +338,22 @@ since the last brief. It prints the brief and writes `outputs/brief-YYYY-MM-DD.m
 
 ```bash
 personal-agent brief             # print and write the file
-personal-agent brief --send      # also post it to PA_DISCORD_WEBHOOK
+personal-agent brief --send      # also send it to the brief channels (paired Telegram bot, else Discord)
 personal-agent brief --polish    # let the small model rewrite the text (see below)
 personal-agent brief --quiet     # write only
 ```
 
 With `PA_BRIEF_TIME=07:30`, `personal-agent serve` sends the brief once a day at that local time
-(`PA_DISCORD_WEBHOOK` alone is enough; remote approvals are not needed). The day is recorded in
+(`PA_TELEGRAM_TOKEN` with a paired bot, or `PA_DISCORD_WEBHOOK`, is enough; remote approvals are not needed). The day is recorded in
 `$PA_STATE_DIR/brief.json`, so a restart, a crash or an earlier manual `brief --send` never causes a
 second post. A failed post is retried at most three times, at least five minutes apart. After downtime
 the brief is only sent while the grace window (`PA_BRIEF_GRACE_MIN`) is still open; missed days are
 never caught up. Local time comes from the process: set `TZ` (e.g. `TZ=Europe/Berlin`) in a container.
 
-**Privacy:** by default Discord only gets counts (`PA_BRIEF_DISCORD=counts`): number of open tasks and
+**Privacy:** on Telegram the brief is sent as full plain text by default (`PA_BRIEF_TELEGRAM=full`, links
+defanged); it then passes through Telegram's servers (see [Telegram](#telegram)). Claude Code sessions
+appear there only as state counts: project names and waiting texts stay on your machine, as with
+`status` and `sessions` over Telegram. The polish step never sees them either. By default Discord only gets counts (`PA_BRIEF_DISCORD=counts`): number of open tasks and
 focus lines, session states, quota and new captures, plus the path of the full brief in the vault. Your
 note and task text stays on your machine. With `full`, the whole brief is posted; every text from notes
 and status files is escaped (no links, no mentions, no formatting) and URLs are shown as `https[:]//`.
@@ -352,19 +366,150 @@ domain, no `@` and no number that the deterministic brief does not contain; othe
 brief is used. The polished text is kept in `$PA_STATE_DIR/brief-polished.json` for retries and
 written to `outputs/brief-YYYY-MM-DD.polished.md` as output only: that file is never read back, because
 the assistant can write the vault. The scheduled brief prints nothing, so `PA_BRIEF_POLISH` only takes
-effect together with `PA_BRIEF_DISCORD=full`; in `counts` mode it would spend a model call every day on
-text nobody sees, and is skipped.
+effect when a channel shows the full text (`PA_BRIEF_DISCORD=full` or `PA_BRIEF_TELEGRAM=full`); in
+`counts` mode it would spend a model call every day on text nobody sees, and is skipped.
 
-If a post fails halfway, the exact chunks of that attempt are kept in `$PA_STATE_DIR/brief-chunks.json`
-(0600, removed after a successful send) and a retry posts only the chunks that did not go out, even
-when the quota or session status changed in between.
+If a post fails halfway, the exact chunks of that attempt are kept per channel in
+`$PA_STATE_DIR/brief-chunks.json` (0600, removed after a successful send) and a retry posts only the
+chunks that did not go out, and only to the channels that did not get everything, even when the quota or
+session status changed in between.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PA_BRIEF_TIME` | – | daily brief time `HH:MM` (local), empty = off; needs `PA_DISCORD_WEBHOOK` |
+| `PA_BRIEF_TIME` | – | daily brief time `HH:MM` (local), empty = off; needs `PA_TELEGRAM_TOKEN` or `PA_DISCORD_WEBHOOK` |
 | `PA_BRIEF_GRACE_MIN` | `120` | minutes after `PA_BRIEF_TIME` in which a late or retried send is still allowed (1–720) |
 | `PA_BRIEF_POLISH` | off | `1`/`true`/`yes`: polish the scheduled brief with the small model (only with `PA_BRIEF_DISCORD=full`) |
 | `PA_BRIEF_DISCORD` | `counts` | `counts` sends only counts to Discord, `full` the escaped brief text |
+| `PA_BRIEF_TELEGRAM` | `full` | what the brief shows on Telegram: `full` (plain text, links defanged) or `counts` |
+
+### Notifications
+
+All notices go through one notification layer. There are five kinds: `brief` (the morning brief),
+`alert` (an escalation sent to `serve`, and whether it calls you), `approval` (the remote approval
+notice), `task_done` (background task counts) and `info` (fixed operational notices, e.g. "the morning
+brief gave up for today"). `PA_NOTIFY_<KIND>` picks the channels for a kind: a comma list of `telegram`,
+`discord`, or `none`. A channel named explicitly that is not ready is skipped with one log line; nothing
+silently falls back to another channel.
+
+Without `PA_NOTIFY_<KIND>`, a kind goes to Telegram when a paired Telegram bot is ready, and otherwise:
+
+| Kind | Default without Telegram |
+|---|---|
+| `brief` | Discord when `PA_DISCORD_WEBHOOK` is set |
+| `approval` | Discord when `PA_DISCORD_WEBHOOK` and `PA_PUBLIC_APPROVAL_URL` are set |
+| `task_done` | Discord only with `PA_TASK_DISCORD=counts` |
+| `alert`, `info` | nowhere (opt-in on Discord with `PA_NOTIFY_ALERT=discord`, `PA_NOTIFY_INFO=discord`) |
+
+So nothing changes for an existing Discord setup. Telegram is ready once a bot is [paired](#telegram);
+until then `telegram` routes are skipped with a log line. `personal-agent telegram status` prints the
+resolved channel for each kind.
+
+**Privacy per kind.** An approval notice never contains the tool input: only the tool name, the level,
+where the request comes from and the one-time link. Task notices carry counts only; with
+`PA_NOTIFY_TASK_DETAIL=title` they add the task id, its status and the cleaned title (at most 60
+characters), never results, errors, domains or paths. Info notices are fixed texts. Every text from notes,
+status files or events is made inert for the channel (no markup, no mentions, links shown as `https[:]//`).
+Each channel has its own size limit (Discord 1900 characters, Telegram 4000 UTF-16 units per message);
+longer notices are split at line boundaries into at most five messages and cut with a note. Alerts are
+limited to ten per ten minutes and the same event key to one per hour; info notices likewise.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PA_NOTIFY_BRIEF`, `PA_NOTIFY_ALERT`, `PA_NOTIFY_APPROVAL`, `PA_NOTIFY_TASK_DONE`, `PA_NOTIFY_INFO` | default rule above | `telegram`, `discord`, a comma list of both, or `none`; `PA_NOTIFY_APPROVAL` takes one value |
+| `PA_NOTIFY_TASK_DETAIL` | `counts` | `title` adds task id, status and cleaned title to task notices |
+| `PA_TELEGRAM_TOKEN` | – | Telegram bot token (a secret, never logged or shown); needed by any `telegram` route |
+
+### Telegram
+
+A Telegram bot brings the agent to your phone: notices, approvals with buttons, and a chat with the same
+assistant as `personal-agent chat`. `serve` reaches Telegram by long polling over outbound HTTPS only:
+no webhook, no open port.
+
+**Privacy first: bot chats are not end-to-end encrypted.** Everything you exchange with the bot passes
+through Telegram's servers: your messages and the assistant's replies, the full morning brief (by
+default), alert summaries, task notices, the tool names of approvals and, when set, the review link.
+Discord keeps counts only by default. If that is not acceptable for some content, keep it in the
+terminal.
+
+Set it up:
+
+1. In Telegram, open the official **@BotFather** chat, send `/newbot` and follow the steps. Copy the
+   token it shows and keep it in your password manager.
+2. In the bot's settings (BotFather → your bot → Bot Settings → Allow Groups), turn **groups off**, so
+   the bot never gets updates from a group.
+3. Set `PA_TELEGRAM_TOKEN` and `PA_APPROVAL_PIN` (at least 6 digits, different from `PA_CALL_PIN`)
+   in your `.env`. `serve` refuses to start with a token but without the PIN.
+4. Pair the bot with your account in a terminal (a running `serve` does not poll while the bot is
+   unpaired; to pair a new account, `unpair` first):
+
+   ```bash
+   personal-agent telegram pair
+   ```
+
+   It prints a one-time link `https://t.me/<bot>?start=<code>` (192 random bits, single use, valid for
+   10 minutes, stored only as a hash). Open it on your phone and press Start. The terminal then shows
+   the requesting user id and asks `bind this account? [y/N]`. Only after `y` is that private chat
+   bound, and the bot confirms. `--yes` binds without asking (for a terminal without input), and when
+   stdout is not a terminal the code is not printed unless you pass `--print-code`, so it does not end
+   up in a log.
+5. Start (or keep running) `personal-agent serve`. It starts polling within five seconds of a pairing
+   and stops within five seconds of an unpairing.
+
+```bash
+personal-agent telegram status     # token set, bot, pairing (chat id masked), poller, webhook, routes
+personal-agent telegram unpair     # forget the chat; a running serve stops polling
+```
+
+The token is never printed, logged or passed to Claude Code; log lines are filtered for anything that
+looks like a bot token. If you think the token leaked: `personal-agent telegram unpair`, revoke the
+token in BotFather (`/revoke`), set the new `PA_TELEGRAM_TOKEN`, restart `serve`, pair again.
+
+**What the bot accepts.** Only messages from the paired user in its private chat count; everything else
+(other users, groups, channels, other bots) is ignored without any reply. Forwarded messages and
+messages sent through an inline bot are refused, messages older than five minutes (sent while `serve`
+was offline) are not executed, and at most 20 messages per minute are read.
+
+**Chat.** Text from your chat goes through the same router as the terminal chat: tier-1 commands
+(`help`, `note <text>`, `tasks`, `task <text>`, `task show <id>`, `quota`, `domains`), the small model
+and the main assistant, with the same approvals, quota guard, slash-command refusal and safety
+tripwires. One turn runs at a time; up to three messages wait in a queue, more get "busy". `/new`
+starts a new conversation. Differences from the terminal, because a stolen phone or account must not
+get more than the terminal gives:
+
+- `status` and `sessions` answer "only in the terminal": session names and waiting texts stay local.
+- `quota reset` is refused; the main assistant cannot delegate.
+- `task <text>` only **queues** a task (`PA_TELEGRAM_TASKS=off` turns that off). It runs when a
+  terminal chat is open, with that chat's approvals, which say `task 3f2a9c · telegram`, and the chat
+  prints where it came from. Notes from Telegram are marked `[via telegram]` in the vault.
+- At most `PA_TELEGRAM_MAX_TURNS_PER_HOUR` model turns per hour (tier 1 stays free).
+- A safety stop (a hook or an unexpected plugin in a session) stops the terminal chat and the Telegram
+  assistant alike. To lift it, run `personal-agent safety clear` in a terminal, then restart `serve` and
+  any open chat: a running process keeps a stop it already holds.
+- `/lock` in the chat removes the pairing at once, also while a PIN is awaited: pending approvals are
+  denied, queued messages dropped and a running turn stopped (you can pair again in a terminal).
+- `PA_TELEGRAM_INBOUND=off` turns the chat off and keeps notices and approvals.
+
+**Approvals over Telegram.** Turns that start in Telegram always ask in Telegram. Each request shows a
+number, the level, the tool name and where it comes from, with **Approve**, **Deny** and, for Telegram
+turns, **Deny and stop turn**. Only presses of the paired user on that very message count, each button
+works once, and the buttons disappear after the decision. Level 3 needs your approval PIN as the next
+message within two minutes; the PIN message is deleted (best effort), never reaches the assistant or a
+log, and three wrong PINs deny. Every wrong PIN counts, from Telegram and from the page alike: six
+within 24 hours disable level-3 remote approvals for 24 hours (`personal-agent telegram status
+--clear-lock` resets that, also for a running `serve`). A message that
+equals one of your PINs is never sent to the assistant, whatever the state. Over Telegram, level 2 is
+one tap: it confirms intent, it is not a security boundary against someone holding your unlocked phone.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PA_TELEGRAM_TOKEN` | – | the bot token from BotFather (a secret) |
+| `PA_TELEGRAM_INBOUND` | `on` | `off`: no chat over Telegram; notices and approvals still work |
+| `PA_TELEGRAM_TASKS` | `queue` | `off`: `task <text>` from Telegram is refused |
+| `PA_TELEGRAM_MAX_TURNS_PER_HOUR` | `30` | model turns from Telegram per hour (1–600) |
+| `PA_BRIEF_TELEGRAM` | `full` | what the brief shows on Telegram: `full` or `counts` |
+
+There is deliberately no setting for another API address: a test server address left in a real `.env`
+would send the token in clear text to whatever local process holds that port.
 
 ## Connect your Claude Code sessions
 
@@ -408,7 +553,7 @@ idle       40 min  personal-agent
   agent view is a research preview, the listing covers every project, and the docs do not say whether
   the call starts the agent-view supervisor. It runs only for the typed `sessions` command, with a
   minimal environment (no API keys, never the assistant's own config dir), a 5 s timeout and a 10 s
-  cache; nothing from it is logged or sent to Discord or the phone.
+  cache; nothing from it is logged or sent to Discord, Telegram or the phone.
 - The agent **never sends anything into your sessions**: Claude Code documents no stable way for a
   separate process to do that. To answer a waiting session, attach in a terminal, use agent view or
   Remote Control. Background in [docs/SESSION-CONTROL.md](docs/SESSION-CONTROL.md).

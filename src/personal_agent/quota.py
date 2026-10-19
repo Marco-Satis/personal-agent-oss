@@ -128,9 +128,36 @@ class QuotaGuard:
         self.clock = clock
         self._lock = threading.Lock()
         self._paid_reason: str | None = None
+        self._file_key: tuple[int, int, int] | None = None
         self._data = self._load()
+        self._file_key = self._stat_key()
 
     # --- state ----------------------------------------------------------------
+
+    def _stat_key(self) -> tuple[int, int, int] | None:
+        if self.state_file is None:
+            return None
+        try:
+            info = os.stat(self.state_file)
+        except OSError:
+            return None
+        return info.st_mtime_ns, info.st_size, info.st_ino
+
+    def _reload_if_changed(self) -> None:
+        """Pick up usage another process saved (the chat and serve's Telegram assistant share
+        quota.json). Only newer observations replace the data in memory. A file that disappeared
+        after we knew it was removed by `quota reset` in another process: forget the data too
+        (a paid-usage block of this process stays). Call under the lock."""
+        key = self._stat_key()
+        if key == self._file_key:
+            return
+        self._file_key = key
+        if key is None:
+            self._data = {}
+            return
+        loaded = self._load()
+        if loaded and loaded["observed_at"] > (self._data.get("observed_at") or 0):
+            self._data = loaded
 
     def _load(self) -> dict:
         if self.state_file is None:
@@ -166,6 +193,7 @@ class QuotaGuard:
                 f.write(json.dumps(self._data))
             os.replace(tmp, self.state_file)
             tmp = None
+            self._file_key = self._stat_key()
         except OSError as exc:
             log.warning("could not save quota state: %s", type(exc).__name__)
         finally:
@@ -188,6 +216,7 @@ class QuotaGuard:
         """Forget the saved quota data (memory and file). A paid-usage block stays."""
         with self._lock:
             self._data = {}
+            self._file_key = None
             if self.state_file is not None:
                 try:
                     self.state_file.unlink()
@@ -252,6 +281,7 @@ class QuotaGuard:
         """
         threshold = self.stop_at if stop_at is None else stop_at
         with self._lock:
+            self._reload_if_changed()
             now = self.clock()
             fresh = True
             if require_fresh_s is not None:
