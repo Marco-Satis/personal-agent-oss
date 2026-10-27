@@ -717,6 +717,11 @@ class Router:
             body, count = self._with_context(body)
             if count and self.on_context is not None:
                 self.on_context(CONTEXT_MARKER)
+        if slash:
+            # Skills otherwise date notes "00:00": the model has no clock of its own. The time
+            # goes after the command, so the CLI still sees the leading "/" and the skill gets
+            # it as part of its arguments.
+            body = f"{body} (local time: {time.strftime('%Y-%m-%d %H:%M %A')})"
         slash_commands = self.slash_commands if session is self.main else frozenset()
         try:
             result = guarded_send(session, body, self.guard, on_event, slash_commands)

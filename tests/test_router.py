@@ -647,9 +647,10 @@ def test_allowed_plugin_command_goes_verbatim_to_tier3(vault):
     router = vault_router(vault, main, small, slash=["/core:daily-plan"])
     reply = router.handle("/core:daily-plan today please")
     assert reply.tier == 3 and reply.context_count == 0
-    assert main.sent == ["/core:daily-plan today please"] and small.sent == []
+    # Verbatim, plus the local time as part of the skill's arguments (skills have no clock).
+    assert main.sent[0].startswith("/core:daily-plan today please (local time: 20") and small.sent == []
     assert router.handle("!​/core:daily-plan").tier == 3
-    assert main.sent[-1] == "/core:daily-plan"
+    assert main.sent[-1].startswith("/core:daily-plan (local time: ")
 
 
 def test_plugin_command_marks_the_approval_context(vault):
