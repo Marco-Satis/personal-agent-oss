@@ -572,6 +572,18 @@ Ogg voice file first (`PA_FFMPEG`). The bot answers "Heard: ..." and then handle
 message, with the same approvals and limits. Voice messages longer than `PA_VOICE_MAX_S` (default 120) are
 refused, and a spoken PIN is never used. Module `voice` (on when `PA_STT_COMMAND` is set).
 
+A ready recognizer is `scripts/stt_faster_whisper.py` (faster-whisper, CPU, int8) in its own virtualenv:
+
+```bash
+python3 -m venv ~/.local/share/personal-agent/stt-venv
+~/.local/share/personal-agent/stt-venv/bin/pip install faster-whisper
+export PA_STT_COMMAND="$HOME/.local/share/personal-agent/stt-venv/bin/python -I /path/to/scripts/stt_faster_whisper.py \
+  --lang de --model small --model-dir $HOME/.local/share/personal-agent/stt-models"
+```
+
+The model is downloaded on first use (about 500 MB for `small`) and read from disk afterwards. On a
+12-core VPS, `small` needs about 3 seconds for an 11-second message.
+
 ## Connect your Claude Code sessions
 
 Your sessions report their state through a small hook (standard library only) that writes one status
