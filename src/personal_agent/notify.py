@@ -371,7 +371,18 @@ def spend_notice(percent: int, day_usd: float, cap_day: float, month_usd: float,
     return build
 
 
-NOTICE_FACTORIES = ("alert_notice", "info_notice", "task_counts_notice", "task_detail_notice", "spend_notice")
+def rhythm_notice(title: str, lines: list[str]) -> Callable[[Target], str]:
+    """A midday, evening or weekly update: our own counts; any name in it is made inert."""
+    def build(target: Target) -> str:
+        inert = getattr(target, "inert", None)
+        shown = [inert(line, 300) if inert else line[:300] for line in lines]
+        return "\n".join([title, *shown])
+
+    return build
+
+
+NOTICE_FACTORIES = ("alert_notice", "info_notice", "task_counts_notice", "task_detail_notice", "spend_notice",
+                    "rhythm_notice")
 
 
 # --- routes --------------------------------------------------------------------

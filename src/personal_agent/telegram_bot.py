@@ -32,7 +32,7 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Callable
 
-from .notify import info_notice, split_message, utf16_len
+from .notify import info_notice, split_message, telegram_untrusted, utf16_len
 from .remote import EXPIRY_MARGIN_S, MAX_WAIT_S, ApprovalInbox, PendingApproval, RemoteChannel
 from .status import clean_text
 from .telegram import (
@@ -93,6 +93,9 @@ TEXTS = {
         "pin_waiting": "Waiting for your PIN; message not sent.",
         "pin_prompt": "PIN for level-3 approval of {tool}: your next message is used as the PIN (2 min).",
         "no_text": "Only text messages are supported.",
+        "heard": "Heard: {text}",
+        "voice_failed": "Could not understand the voice message ({reason}). Please type it.",
+        "voice_long": "Voice messages up to {n} seconds only.",
         "forwarded": "Forwarded messages are not processed; copy the text if you mean it.",
         "new": "Started a new conversation.",
         "terminal_only": "Only in the terminal.",
@@ -126,6 +129,9 @@ TEXTS = {
         "pin_waiting": "Warte auf deine PIN; Nachricht nicht gesendet.",
         "pin_prompt": "PIN für die Stufe-3-Freigabe von {tool}: deine nächste Nachricht gilt als PIN (2 Min.).",
         "no_text": "Nur Textnachrichten werden unterstützt.",
+        "heard": "Verstanden: {text}",
+        "voice_failed": "Sprachnachricht nicht verstanden ({reason}). Bitte tippen.",
+        "voice_long": "Sprachnachrichten nur bis {n} Sekunden.",
         "forwarded": "Weitergeleitete Nachrichten werden nicht verarbeitet; kopiere den Text, wenn du ihn meinst.",
         "new": "Neues Gespräch begonnen.",
         "terminal_only": "Nur im Terminal.",
@@ -411,6 +417,20 @@ class TelegramFrontend:
         if any(message.get(name) is not None for name in FORWARD_FIELDS):
             self.reply(t["forwarded"])
             return
+        voice = message.get("voice")
+        if not text and isinstance(voice, dict) and self.config.stt_command is not None:
+            file_id, duration = voice.get("file_id"), voice.get("duration")
+            if not isinstance(file_id, str) or not _int(duration):
+                self.reply(t["no_text"])
+                return
+            if duration > self.config.voice_max_s:
+                self.reply(t["voice_long"].format(n=self.config.voice_max_s))
+                return
+            if not self.config.telegram_inbound:
+                self.reply(t["inbound_off"])
+                return
+            self._enqueue(("voice", file_id))
+            return
         if not text:
             self.reply(t["no_text"])
             return
@@ -507,6 +527,24 @@ class TelegramFrontend:
             runtime = None
         text = runtime.router.help_text() if runtime is not None else ""
         self.reply("\n".join(line for line in (text, self.texts["approvals"]) if line))
+
+    def _transcribe(self, file_id: str | None) -> str | None:
+        """A voice message as text (worker thread), or None after telling the owner why."""
+        from .stt import MAX_AUDIO_BYTES, SttError, transcribe
+        from .telegram import TelegramError
+
+        try:
+            audio = self.client.download(file_id or "", MAX_AUDIO_BYTES)
+            text = transcribe(audio, self.config)
+        except (SttError, TelegramError) as exc:
+            reason = exc.args[0] if exc.args and isinstance(exc.args[0], str) else type(exc).__name__
+            self.reply(self.texts["voice_failed"].format(reason=reason[:20]))
+            return None
+        if PIN_LIKE.fullmatch(text) or self._is_known_pin(text):
+            self.reply(self.texts["pin_like"])  # a spoken PIN is never used
+            return None
+        self.reply(self.texts["heard"].format(text=telegram_untrusted(text, 400)))
+        return text
 
     def _enqueue(self, item: tuple[str, str | None]) -> None:
         ahead = self._queue.qsize() + (1 if self._busy.is_set() else 0)
@@ -609,6 +647,10 @@ class TelegramFrontend:
                     runtime.reset_conversation()
                     self.reply(self.texts["new"])
                     continue
+                if kind == "voice":
+                    text = self._transcribe(text)
+                    if text is None:
+                        continue
                 assert text is not None
                 if not self._turn_allowed(runtime, text):
                     self.reply(self.texts["turn_limit"])

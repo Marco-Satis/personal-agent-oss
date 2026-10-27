@@ -336,3 +336,43 @@ def test_the_pin_never_reaches_the_assistant(front, caplog):
     assert wait_until(lambda: len(front.api.calls_of("deleteMessage")) == 2)
     assert front.runtime.turns == []
     assert PIN not in caplog.text and PIN not in json.dumps(front.api.calls_of("sendMessage"))
+
+
+# --- voice messages (M3) ------------------------------------------------------------------
+
+
+def voice_front(front, tmp_path, monkeypatch, recognizer_output="Termin morgen um neun"):
+    import dataclasses
+    import stat as stat_mod
+
+    stt = tmp_path / "stt"
+    stt.write_text(f"#!/bin/sh\nprintf '{recognizer_output}'\n")
+    stt.chmod(stt.stat().st_mode | stat_mod.S_IXUSR)
+    ffmpeg = tmp_path / "ffmpeg"
+    ffmpeg.write_text('#!/bin/sh\nfor a; do last="$a"; done\ncp "$5" "$last"\n')
+    ffmpeg.chmod(ffmpeg.stat().st_mode | stat_mod.S_IXUSR)
+    front.frontend.config = dataclasses.replace(front.config, stt_command=(str(stt),), ffmpeg_bin=str(ffmpeg))
+    monkeypatch.setattr(front.frontend.client, "download", lambda file_id, max_bytes, **kw: b"OggS audio")
+    return front
+
+
+def test_voice_message_is_transcribed_and_routed(front, tmp_path, monkeypatch):
+    voice_front(front, tmp_path, monkeypatch)
+    front.message(None, voice={"file_id": "v1", "duration": 4})
+    wait_text(front.api, "Heard: Termin morgen um neun")
+    assert wait_until(lambda: front.runtime.turns == ["Termin morgen um neun"])
+
+
+def test_voice_is_ignored_without_a_recognizer(front):
+    front.message(None, voice={"file_id": "v1", "duration": 4})
+    wait_text(front.api, "Only text messages are supported.")
+    assert front.runtime.turns == []
+
+
+def test_long_voice_and_spoken_pins_are_refused(front, tmp_path, monkeypatch):
+    voice_front(front, tmp_path, monkeypatch, recognizer_output=PIN)
+    front.message(None, voice={"file_id": "v1", "duration": 9999})
+    wait_text(front.api, "Voice messages up to 120 seconds only.")
+    front.message(None, voice={"file_id": "v2", "duration": 3})
+    assert wait_until(lambda: any("PIN" in t or "pin" in t for t in front.api.sent_texts()[-1:]))
+    assert front.runtime.turns == []

@@ -16,6 +16,8 @@ from pathlib import Path
 
 from .status import SESSION_SOURCES
 from .modules import parse_modules
+from .rhythm import parse_slot_time, parse_weekly
+from .stt import parse_command as parse_stt_command
 
 
 class ConfigError(ValueError):
@@ -261,6 +263,13 @@ class Config:
     access_mode: str = "subscription"
     claude_api_key: str | None = field(default=None, repr=False)  # only in access_mode "api"
     modules: tuple[str, ...] = MODULE_DEFAULTS  # PA_MODULES (modules.py)
+    rhythm_midday: tuple[int, int] | None = None   # PA_RHYTHM_MIDDAY HH:MM (rhythm.py); None = off
+    rhythm_evening: tuple[int, int] | None = None  # PA_RHYTHM_EVENING HH:MM
+    rhythm_weekly: tuple[int, int, int] | None = None  # PA_RHYTHM_WEEKLY "fri 16:30"
+    stt_command: tuple[str, ...] | None = None  # PA_STT_COMMAND (stt.py); None = voice messages off
+    stt_timeout_s: int = 120
+    voice_max_s: int = 120              # PA_VOICE_MAX_S: longer voice messages are refused
+    ffmpeg_bin: str = "ffmpeg"
     spend_cap_day_usd: float = 3.0      # access_mode "api" only (spend.SpendGuard)
     spend_cap_month_usd: float = 40.0
     approval_timeout_s: int = 300
@@ -375,6 +384,22 @@ class Config:
             modules = parse_modules(_env("PA_MODULES"))
         except ValueError as exc:
             raise ConfigError(f"PA_MODULES: {exc}") from None
+        try:
+            rhythm_midday = parse_slot_time(_env("PA_RHYTHM_MIDDAY")) if "brief" in modules else None
+            rhythm_evening = parse_slot_time(_env("PA_RHYTHM_EVENING")) if "brief" in modules else None
+            rhythm_weekly = parse_weekly(_env("PA_RHYTHM_WEEKLY")) if "brief" in modules else None
+        except ValueError:
+            raise ConfigError("PA_RHYTHM_MIDDAY/EVENING take HH:MM; PA_RHYTHM_WEEKLY takes e.g. 'fri 16:30'") from None
+        try:
+            stt_command = parse_stt_command(_env("PA_STT_COMMAND")) if "voice" in modules else None
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
+        stt_timeout_s = _env_int("PA_STT_TIMEOUT_S", 120)
+        if not 10 <= stt_timeout_s <= 600:
+            raise ConfigError("PA_STT_TIMEOUT_S must be between 10 and 600 seconds")
+        voice_max_s = _env_int("PA_VOICE_MAX_S", 120)
+        if not 5 <= voice_max_s <= 600:
+            raise ConfigError("PA_VOICE_MAX_S must be between 5 and 600 seconds")
         brief_discord = (_env("PA_BRIEF_DISCORD", "counts") or "counts").lower()
         if brief_discord not in BRIEF_DISCORD_MODES:
             raise ConfigError("PA_BRIEF_DISCORD must be 'counts' or 'full'")
@@ -500,6 +525,13 @@ class Config:
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),
             brief_time=_parse_brief_time(_env("PA_BRIEF_TIME")) if "brief" in modules else None,
             modules=modules,
+            rhythm_midday=rhythm_midday,
+            rhythm_evening=rhythm_evening,
+            rhythm_weekly=rhythm_weekly,
+            stt_command=stt_command,
+            stt_timeout_s=stt_timeout_s,
+            voice_max_s=voice_max_s,
+            ffmpeg_bin=_env("PA_FFMPEG", "ffmpeg") or "ffmpeg",
             brief_grace_min=brief_grace_min,
             brief_polish=(_env("PA_BRIEF_POLISH", "") or "").lower() in ("1", "true", "yes"),
             brief_discord=brief_discord,

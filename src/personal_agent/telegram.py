@@ -300,6 +300,33 @@ class TelegramClient:
             if slot > now:
                 self._sleep(slot - now)
 
+    def download(self, file_id: str, max_bytes: int, *, timeout_s: float = 30.0) -> bytes:
+        """The bytes of a file the owner sent (getFile, then the file endpoint), at most
+        max_bytes. Raises TelegramError (never with a URL or the token)."""
+        if not isinstance(file_id, str) or not 0 < len(file_id) <= 256:
+            raise TelegramError("bad_response")
+        info = self.call("getFile", {"file_id": file_id}, timeout_s=timeout_s)
+        path = info.get("file_path") if isinstance(info, dict) else None
+        size = info.get("file_size") if isinstance(info, dict) else None
+        if not isinstance(path, str) or not re.fullmatch(r"[A-Za-z0-9_./-]{1,256}", path) or ".." in path:
+            raise TelegramError("bad_response")
+        if isinstance(size, int) and size > max_bytes:
+            raise TelegramError("too_large")
+        failed = False
+        raw = b""
+        try:
+            request = urllib.request.Request(f"{self.api_base}/file/bot{self._token}/{path}", method="GET")
+            request.add_header("User-Agent", f"personal-agent/{__version__}")
+            with self._opener(request, timeout=timeout_s) as response:
+                raw = response.read(max_bytes + 1)
+        except Exception:  # noqa: BLE001 - the text can hold the URL with the token
+            failed = True
+        if failed:
+            raise TelegramError("network")
+        if len(raw) > max_bytes:
+            raise TelegramError("too_large")
+        return raw
+
     def call(self, method: str, params: dict | None = None, *, timeout_s: float | None = None,
              deadline: float | None = None) -> object:
         """One request. Returns `result`; raises TelegramError (never with a URL or the token)."""

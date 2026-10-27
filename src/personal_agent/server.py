@@ -517,6 +517,21 @@ def start_brief_thread(config: Config, stop: threading.Event,
     return thread
 
 
+def start_rhythm_thread(config: Config, stop: threading.Event,
+                        notifier: Notifier | None = None) -> threading.Thread | None:
+    """Midday/evening updates and the weekly review (rhythm.py), or None when all are off."""
+    from .rhythm import RhythmScheduler
+
+    scheduler = RhythmScheduler(config, notifier=notifier)
+    if not scheduler.active:
+        return None
+    thread = threading.Thread(target=_brief_loop, args=(scheduler, stop), daemon=True, name="rhythm")
+    thread.start()
+    log.info("rhythm updates on (midday %s, evening %s, weekly %s)", config.rhythm_midday,
+             config.rhythm_evening, config.rhythm_weekly)
+    return thread
+
+
 def serve(config: Config) -> None:
     config.validate_for_serve()
     config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -546,6 +561,7 @@ def serve(config: Config) -> None:
     watcher = threading.Thread(target=_watch_loop, args=(agent, stop), daemon=True, name="session-watch")
     watcher.start()
     start_brief_thread(config, stop, notifier)
+    start_rhythm_thread(config, stop, notifier)
     if telegram is not None:
         telegram.start(agent.approvals)
         log.info("telegram enabled: the assistant polls once the bot is paired (personal-agent telegram pair)")

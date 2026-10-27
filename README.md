@@ -399,6 +399,13 @@ session status changed in between.
 | `PA_BRIEF_DISCORD` | `counts` | `counts` sends only counts to Discord, `full` the escaped brief text |
 | `PA_BRIEF_TELEGRAM` | `full` | what the brief shows on Telegram: `full` (plain text, links defanged) or `counts` |
 
+**More of the day (opt-in).** One brief a day is the default. `PA_RHYTHM_MIDDAY=12:30` and
+`PA_RHYTHM_EVENING=18:00` add a short update: mail that came in since the last message, by category; what is
+still unread and needs you (deadline/legal, complaint, request); how the background tasks went; mailbox
+problems. `PA_RHYTHM_WEEKLY="fri 16:30"` adds a weekly review: the week's mail by category and how many
+requests were answered. All counts, no model, and never anything about a person. Each update goes out at most
+once (within an hour of its time), through the brief channels.
+
 ### Notifications
 
 All notices go through one notification layer. There are five kinds: `brief` (the morning brief),
@@ -555,6 +562,15 @@ health shows up in `mail` and in the morning brief: a failed login (often a chan
 that is hours old, or several working days without any new mail. A dead login must never look like a quiet
 inbox. Drafts need `"allow_draft_append": true` for the account; that worker session may additionally use
 `LIST` and `APPEND` (with the `\Draft` flag), nothing else.
+
+### Voice messages
+
+Send the Telegram bot a voice message instead of typing. It is turned into text **on your own server** by a
+speech recognizer you choose (`PA_STT_COMMAND`: an absolute path plus fixed arguments, for example a
+whisper.cpp binary; the WAV file path is appended, the transcript is read from stdout). `ffmpeg` converts the
+Ogg voice file first (`PA_FFMPEG`). The bot answers "Heard: ..." and then handles the text like a typed
+message, with the same approvals and limits. Voice messages longer than `PA_VOICE_MAX_S` (default 120) are
+refused, and a spoken PIN is never used. Module `voice` (on when `PA_STT_COMMAND` is set).
 
 ## Connect your Claude Code sessions
 
