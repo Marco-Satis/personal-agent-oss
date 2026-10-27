@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .status import SESSION_SOURCES
+from .modules import parse_modules
 
 
 class ConfigError(ValueError):
@@ -176,6 +177,11 @@ def _validate_routes(routes: tuple[tuple[str, tuple[str, ...]], ...], telegram_t
 
 
 _BRIEF_TIME = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+MODULE_DEFAULTS = parse_modules(None)
+
+# Exactly one way to reach Claude per installation: the owner's own subscription
+# (Claude Code login) or an API key that is billed per token. Never both.
+ACCESS_MODES = ("subscription", "api")
 BRIEF_DISCORD_MODES = ("counts", "full")
 BRIEF_TELEGRAM_MODES = ("counts", "full")
 TASK_DISCORD_MODES = ("off", "counts")
@@ -251,6 +257,11 @@ class Config:
     core_plugin_off: bool = False    # PA_CORE_PLUGIN_DIR=off
     claude_config_dir: Path | None = None
     claude_oauth_token: str | None = field(default=None, repr=False)
+    access_mode: str = "subscription"
+    claude_api_key: str | None = field(default=None, repr=False)  # only in access_mode "api"
+    modules: tuple[str, ...] = MODULE_DEFAULTS  # PA_MODULES (modules.py)
+    spend_cap_day_usd: float = 3.0      # access_mode "api" only (spend.SpendGuard)
+    spend_cap_month_usd: float = 40.0
     approval_timeout_s: int = 300
     quota_stop: float = 0.9
     router_small_model: str | None = "haiku"
@@ -352,10 +363,14 @@ class Config:
         brief_grace_min = _env_int("PA_BRIEF_GRACE_MIN", 120)
         if not 1 <= brief_grace_min <= 720:
             raise ConfigError("PA_BRIEF_GRACE_MIN must be between 1 and 720 minutes")
+        try:
+            modules = parse_modules(_env("PA_MODULES"))
+        except ValueError as exc:
+            raise ConfigError(f"PA_MODULES: {exc}") from None
         brief_discord = (_env("PA_BRIEF_DISCORD", "counts") or "counts").lower()
         if brief_discord not in BRIEF_DISCORD_MODES:
             raise ConfigError("PA_BRIEF_DISCORD must be 'counts' or 'full'")
-        tasks_enabled = _env_bool("PA_TASKS", True)
+        tasks_enabled = _env_bool("PA_TASKS", True) and "tasks" in modules
         task_parallel = _env_int("PA_TASK_PARALLEL", 2)
         if not 1 <= task_parallel <= 2:
             raise ConfigError("PA_TASK_PARALLEL must be 1 or 2")
@@ -374,12 +389,14 @@ class Config:
         domain_context_chars = _env_int("PA_DOMAIN_CONTEXT_CHARS", 4000)
         if not 0 <= domain_context_chars <= 8000:
             raise ConfigError("PA_DOMAIN_CONTEXT_CHARS must be between 0 and 8000 (0 attaches no domain notes)")
+        if "domains" not in modules:
+            domain_context_chars = 0
         sessions_source = (_env("PA_SESSIONS_SOURCE", "hooks") or "hooks").lower()
         if sessions_source not in SESSION_SOURCES:
             raise ConfigError("PA_SESSIONS_SOURCE must be 'hooks', 'agents' or 'both'")
         discord_webhook = _parse_webhook(_env("PA_DISCORD_WEBHOOK"))
         public_approval_url = _parse_public_approval_url(_env("PA_PUBLIC_APPROVAL_URL"))
-        telegram_token = _parse_telegram_token(_env("PA_TELEGRAM_TOKEN"))
+        telegram_token = _parse_telegram_token(_env("PA_TELEGRAM_TOKEN")) if "telegram" in modules else None
         notify_routes = tuple(
             (kind, route) for kind in NOTIFY_KINDS
             if (route := _parse_route(kind, _env(f"PA_NOTIFY_{kind.upper()}"))) is not None
@@ -397,6 +414,26 @@ class Config:
         telegram_max_turns = _env_int("PA_TELEGRAM_MAX_TURNS_PER_HOUR", 30)
         if not 1 <= telegram_max_turns <= 600:
             raise ConfigError("PA_TELEGRAM_MAX_TURNS_PER_HOUR must be between 1 and 600")
+        access_mode = (_env("PA_ACCESS_MODE", "subscription") or "subscription").lower()
+        if access_mode not in ACCESS_MODES:
+            raise ConfigError("PA_ACCESS_MODE must be 'subscription' or 'api'")
+        oauth_token = _env("CLAUDE_CODE_OAUTH_TOKEN")
+        api_key = None
+        if access_mode == "api":
+            api_key = _env("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise ConfigError("PA_ACCESS_MODE=api needs ANTHROPIC_API_KEY")
+            if oauth_token:
+                raise ConfigError(
+                    "PA_ACCESS_MODE=api must not be combined with CLAUDE_CODE_OAUTH_TOKEN "
+                    "(exactly one access path per installation)"
+                )
+        spend_cap_month = _env_float("PA_SPEND_CAP_MONTH_USD", 40.0)
+        if not 0 < spend_cap_month <= 10_000:
+            raise ConfigError("PA_SPEND_CAP_MONTH_USD must be greater than 0 and at most 10000")
+        spend_cap_day = _env_float("PA_SPEND_CAP_DAY_USD", min(3.0, spend_cap_month))
+        if not 0 < spend_cap_day <= spend_cap_month:
+            raise ConfigError("PA_SPEND_CAP_DAY_USD must be greater than 0 and at most PA_SPEND_CAP_MONTH_USD")
 
         return cls(
             state_dir=state_dir,
@@ -422,7 +459,11 @@ class Config:
             core_plugin=core_plugin,
             core_plugin_off=core_plugin_off,
             claude_config_dir=_optional_path("PA_CLAUDE_CONFIG_DIR"),
-            claude_oauth_token=_env("CLAUDE_CODE_OAUTH_TOKEN"),
+            claude_oauth_token=oauth_token,
+            access_mode=access_mode,
+            claude_api_key=api_key,
+            spend_cap_day_usd=spend_cap_day,
+            spend_cap_month_usd=spend_cap_month,
             approval_timeout_s=approval_timeout_s,
             quota_stop=quota_stop,
             router_small_model=small_model,
@@ -431,7 +472,8 @@ class Config:
             public_approval_url=public_approval_url,
             approval_pin=approval_pin,
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),
-            brief_time=_parse_brief_time(_env("PA_BRIEF_TIME")),
+            brief_time=_parse_brief_time(_env("PA_BRIEF_TIME")) if "brief" in modules else None,
+            modules=modules,
             brief_grace_min=brief_grace_min,
             brief_polish=(_env("PA_BRIEF_POLISH", "") or "").lower() in ("1", "true", "yes"),
             brief_discord=brief_discord,

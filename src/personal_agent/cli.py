@@ -421,6 +421,7 @@ def _start_tasks(config: Config, args: argparse.Namespace, console: object, brok
             workdir=workdir, config_dir=config_dir, claude_bin=config.claude_bin, model=model,
             system_prompt_file=helper_prompt, permission_tool=permission_tool, server_name=server_name,
             oauth_token=config.claude_oauth_token,
+            api_key=config.claude_api_key,
         )
         return ClaudeSession(cfg, extra_env=dict(mcp_timeout),
                              turn_timeout_s=helper_turn_timeout(config.approval_timeout_s))
@@ -557,6 +558,18 @@ def _telegram_status(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_modules(config: Config, args: argparse.Namespace) -> int:
+    """Access mode, usage guard and the modules this installation runs (starts no model)."""
+    from .modules import describe
+    from .spend import make_guard
+
+    print(f"access mode: {config.access_mode}")
+    print(f"usage: {make_guard(config).describe()}")
+    for line in describe(config.modules):
+        print(line)
+    return 0
+
+
 def _cmd_safety(config: Config, args: argparse.Namespace) -> int:
     """Show or clear the safety stop that every session of this agent shares."""
     from .router import clear_shared_stop, read_shared_stop
@@ -639,6 +652,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--clear-lock", action="store_true", help="reset the PIN lockout counter")
     telegram_sub.add_parser("unpair", help="forget the paired chat (a running serve stops polling)")
 
+    sub.add_parser("modules", help="access mode, spend or quota, and the modules this installation runs")
+
     safety = sub.add_parser("safety", help="the safety stop shared by every session of this agent")
     safety_sub = safety.add_subparsers(dest="safety_command", required=True)
     safety_sub.add_parser("status", help="show the safety stop")
@@ -658,6 +673,7 @@ COMMANDS = {
     "hooks": _cmd_hooks,
     "telegram": _cmd_telegram,
     "safety": _cmd_safety,
+    "modules": _cmd_modules,
 }
 
 

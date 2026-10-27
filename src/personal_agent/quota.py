@@ -16,8 +16,10 @@ otherwise stale data would block forever, because only a turn brings new data.
 Paid overage is the exception: a probe turn would itself be billed, so it blocks
 until the latest known reset, or, with none known, until `quota reset`.
 
-Paid fallback is excluded twice: the bridge never passes API keys, and a session
-whose init event reports an API key source is stopped (see `block_paid`).
+In access mode "subscription" paid fallback is excluded twice: the bridge never
+passes an API key, and a session whose init event reports an API key source is
+stopped (see `block_paid`). In access mode "api" the installation pays per token on
+purpose and the spend guard, not this module, bounds the cost.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ WINDOWS = ("five_hour", "seven_day")
 ALLOWED_STATUSES = ("allowed", "allowed_warning")  # documented values: allowed, allowed_warning, rejected
 WINDOW_LABELS = {"five_hour": "five-hour window", "seven_day": "seven-day window"}
 SUBSCRIPTION_KEY_SOURCE = "none"  # init event `apiKeySource` when no API key is in use
+API_KEY_SOURCE = "ANTHROPIC_API_KEY"  # init event `apiKeySource` in access mode "api"  # pragma: allowlist secret
 RESET_COMMAND = "quota reset"     # chat command that clears the saved quota data
 
 

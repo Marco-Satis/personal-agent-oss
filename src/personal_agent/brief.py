@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Callable
 from .bridge import BridgeConfig, BridgeError, ClaudeSession
 from .plugins import prepare_state_dir
 from .quota import QuotaGuard
+from .spend import make_guard
 from .notify import DISCORD_MARKUP as _DISCORD_MARKUP
 from .notify import (
     TARGET_NAMES,
@@ -524,6 +525,7 @@ def _polish_session(config: "Config") -> ClaudeSession:
             tools=(),
             persist_session=False,
             oauth_token=config.claude_oauth_token,
+            api_key=config.claude_api_key,
         )
     )
 
@@ -805,7 +807,7 @@ def _run_locked(config: "Config", now: datetime, send: bool, polish: bool, by: s
         since = state["since"]  # the same brief as the failed attempt, so the send can resume
 
     vault = Vault(config.vault_path, config.language)
-    guard = QuotaGuard(config.quota_stop, config.state_dir / "quota.json")  # fresh: sees the chat's usage
+    guard = make_guard(config)  # fresh: sees the chat's usage
     statuses = read_statuses(config.status_dir, config.status_max_age_min, now=ts)
     data = collect_brief(vault, guard, statuses, now, since, config.language)
     text = render_markdown(data, config.language)

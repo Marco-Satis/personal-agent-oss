@@ -39,6 +39,8 @@ A message that contains <user-message>...</user-message> or
 <delegated-request ...>...</delegated-request> (helper tasks, notes context) is
 interpreted by the unescaped body of the last such block (the echo still shows the
 whole message).
+Each result reports total_cost_usd = FAKE_CLAUDE_COST x turns so far (cumulative, like
+the real CLI; default 0).
 The init event reports apiKeySource from FAKE_CLAUDE_API_KEY_SOURCE (default
 "none", i.e. subscription login), the tools from --tools, the MCP servers from
 --mcp-config, one plugin per --plugin-dir (name from its plugin.json, source
@@ -201,8 +203,10 @@ def main():
         sys.exit(int(os.environ.get("FAKE_CLAUDE_AGENTS_EXIT") or 0))
     session =args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
     started = False
+    turns_done = 0
     for line in sys.stdin:
         msg = json.loads(line)
+        turns_done += 1
         raw = msg["message"]["content"]
         text = command_of(raw)
         if not started:
@@ -324,7 +328,8 @@ def main():
             "result": answer,
             "session_id": session,
             "permission_denials": denials,
-            "total_cost_usd": 0.0,
+            # Cumulative for the process, like the real CLI; per-turn step from FAKE_CLAUDE_COST.
+            "total_cost_usd": round(float(os.environ.get("FAKE_CLAUDE_COST") or 0) * turns_done, 6),
         })
         if text == "STRAY":
             time.sleep(0.2)

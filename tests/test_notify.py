@@ -16,7 +16,7 @@ import pytest
 import personal_agent
 from personal_agent import brief as brief_mod
 from personal_agent import notify
-from personal_agent.bridge import BridgeConfig, build_env
+from personal_agent.bridge import NO_TELEMETRY_ENV, BridgeConfig, build_env
 from personal_agent.brief import BriefScheduler, collect_brief, discord_chunks, load_state, run_brief
 from personal_agent.config import Config, ConfigError
 from personal_agent.coordinator import TaskEvent, TaskNotifier
@@ -199,7 +199,7 @@ def test_the_bot_token_never_reaches_the_claude_process():
     base = {"PATH": "/usr/bin", "HOME": "/home/x", "PA_TELEGRAM_TOKEN": TOKEN, "PA_DISCORD_WEBHOOK": HOOK}
     child = build_env(BridgeConfig(workdir=Path("/w"), config_dir=Path("/c")), base=base)
     assert TOKEN not in json.dumps(child) and HOOK not in json.dumps(child)
-    assert set(child) <= {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "CLAUDE_CONFIG_DIR"}
+    assert set(child) <= {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "CLAUDE_CONFIG_DIR", *NO_TELEMETRY_ENV}
 
 
 # --- route resolution ----------------------------------------------------------

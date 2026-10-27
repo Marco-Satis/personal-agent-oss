@@ -63,15 +63,32 @@ personal-agent status
 
 ## Talk to the assistant (preview)
 
-The assistant runs on your own Claude subscription through the unmodified Claude Code CLI, locked down:
-restricted mode (no shell, file tools only in its own vault), an explicit tool allowlist, only its own
-MCP servers, and no API keys in its environment, so it never falls back to paid API usage.
+The assistant runs through the unmodified Claude Code CLI, locked down: restricted mode (no shell, file
+tools only in its own vault), an explicit tool allowlist, only its own MCP servers, and telemetry and error
+reporting switched off.
+
+Each installation uses **exactly one access path** (`PA_ACCESS_MODE`):
+
+| Mode | For | Credential | Guard |
+|---|---|---|---|
+| `subscription` (default) | your own personal use | your Claude login (`CLAUDE_CODE_OAUTH_TOKEN` or `PA_CLAUDE_CONFIG_DIR`) | quota guard: stops before the plan's usage windows run out; an API key never reaches the CLI, so it never falls back to paid usage |
+| `api` | a business, or anything run for other people | `ANTHROPIC_API_KEY` from the business's own Claude Console | spend guard: daily and monthly caps in USD (`PA_SPEND_CAP_DAY_USD`, default 3; `PA_SPEND_CAP_MONTH_USD`, default 40), notice at 50/80/100 % |
+
+Setting both credentials in `api` mode is a configuration error. A subscription login is for your own
+use; anything you run for a business or for other people needs an API key under Anthropic's commercial
+terms. Also set a workspace spend limit in the Claude Console: the guard can overrun its cap by one turn,
+because a turn's cost is known only when it ends.
 
 ```bash
 claude setup-token                       # once; keep the token in your password manager
 export CLAUDE_CODE_OAUTH_TOKEN=...       # or PA_CLAUDE_CONFIG_DIR pointing at an existing login
 personal-agent chat
+personal-agent modules                   # access mode, usage, and which modules run
 ```
+
+**Modules.** The core always runs; the brief, background tasks, domains and the Telegram bot are modules.
+`PA_MODULES=brief,telegram` runs only those (default: all; `none` runs the core alone). A module switched
+off here wins over its own settings.
 
 The assistant may read, search, write and edit files in its [vault](#the-vault). **Writing asks you first:**
 

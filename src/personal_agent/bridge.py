@@ -30,6 +30,13 @@ log = logging.getLogger(__name__)
 MAX_PROMPT_CHARS = 20_000
 DEFAULT_TURN_TIMEOUT_S = 600
 ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TZ")
+# Documented Claude Code switches: no usage telemetry, no error reports, and no other
+# non-essential traffic (auto-updates included) leave the server.
+NO_TELEMETRY_ENV = {
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+}
 SKILL_TOOL = "Skill"
 # The main assistant's tool to queue a background task (approval_server.DELEGATE_TOOL_NAME
 # on our own "pa" server). Defined here because this module must not import approval.
@@ -93,6 +100,9 @@ class BridgeConfig:
     allowed_skills: tuple[str, ...] = ()  # "<plugin>:<name>" the Skill tool and "/" messages may use
     persist_session: bool = True  # False: --no-session-persistence (no transcript under config_dir)
     oauth_token: str | None = field(default=None, repr=False)
+    # Set only for an installation in access mode "api" (config.ACCESS_MODES). Then the
+    # child gets ANTHROPIC_API_KEY and never the OAuth token: one access path, no mixing.
+    api_key: str | None = field(default=None, repr=False)
     # MCP tool names the init tripwire accepts besides `tools` (e.g. the delegation tool).
     # Never passed to --tools, which filters only built-in tools.
     extra_tools: tuple[str, ...] = ()
@@ -137,11 +147,21 @@ def build_args(config: BridgeConfig, resume: str | None = None) -> list[str]:
 
 
 def build_env(config: BridgeConfig, base: dict[str, str] | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Minimal environment for the child. API keys are never passed on."""
+    """Minimal environment for the child.
+
+    Nothing secret is inherited from `base`. The only credential is the one from the
+    installation's access mode: the OAuth token (subscription) or the API key (api),
+    never both. Telemetry and error reporting are off in every mode.
+    """
+    if config.api_key and config.oauth_token:
+        raise BridgeError("an API key and an OAuth token are both set; exactly one access path is allowed")
     base = os.environ if base is None else base
     env = {key: base[key] for key in ENV_PASSTHROUGH if key in base}
+    env.update(NO_TELEMETRY_ENV)
     env["CLAUDE_CONFIG_DIR"] = str(config.config_dir)
-    if config.oauth_token:
+    if config.api_key:
+        env["ANTHROPIC_API_KEY"] = config.api_key
+    elif config.oauth_token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = config.oauth_token
     env.update(extra or {})
     return env

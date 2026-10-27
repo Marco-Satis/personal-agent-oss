@@ -80,6 +80,7 @@ def helper_bridge_config(
     server_name: str,
     oauth_token: str | None,
     max_turns: int = HELPER_MAX_TURNS,
+    api_key: str | None = None,
 ) -> BridgeConfig:
     """The locked-down configuration of one helper session."""
     return BridgeConfig(
@@ -97,6 +98,7 @@ def helper_bridge_config(
         allowed_skills=(),
         persist_session=False,  # one-shot: no transcript
         oauth_token=oauth_token,
+        api_key=api_key,
         max_turns=max_turns,
     )
 

@@ -182,7 +182,7 @@ def prepare_assistant(config: Config, *, label: str, channel: Callable[["Approva
     from .approval import ApprovalBroker
     from .domains import Domains
     from .plugins import invocable, load_for_session
-    from .quota import QuotaGuard
+    from .spend import make_guard
     from .router import SafetyLatch
     from .vault import Vault, VaultError
 
@@ -230,7 +230,7 @@ def prepare_assistant(config: Config, *, label: str, channel: Callable[["Approva
         plugin_names=plugin_names,
         allowed_skills=tuple(allowed_skills),
         broker=broker,
-        guard=QuotaGuard(config.quota_stop, config.state_dir / "quota.json"),
+        guard=make_guard(config),
         latch=SafetyLatch(config.state_dir),  # one stop for this process and every other one
         domains=Domains(vault),
         mcp_path=mcp_path,
@@ -318,6 +318,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
             expected_mcp=(SERVER_NAME,),
             allowed_skills=parts.allowed_skills,
             oauth_token=config.claude_oauth_token,
+            api_key=config.claude_api_key,
             extra_tools=(DELEGATE_TOOL,) if delegation else (),
         ),
         extra_env=dict(parts.mcp_timeout),
@@ -334,6 +335,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
                 model=config.router_small_model,
                 tools=(),
                 oauth_token=config.claude_oauth_token,
+                api_key=config.claude_api_key,
             )
         )
     router = Router(

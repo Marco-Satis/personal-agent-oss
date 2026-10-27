@@ -506,6 +506,22 @@ def test_chat_api_key_source_stops_everything(chat, capsys):
     assert len(chat.starts()) == 1  # no second process, no second send
 
 
+def test_chat_api_mode_passes_the_key_and_stops_at_the_spend_cap(chat, capsys, monkeypatch):
+    chat.make_wrapper("FAKE_CLAUDE_API_KEY_SOURCE=ANTHROPIC_API_KEY FAKE_CLAUDE_COST=0.6 ")
+    monkeypatch.setenv("PA_ACCESS_MODE", "api")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")  # pragma: allowlist secret
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PA_SPEND_CAP_DAY_USD", "1")
+    monkeypatch.setenv("PA_SPEND_CAP_MONTH_USD", "10")
+    assert chat.run(["!hello", "!again", "!third", "quota", "/exit"]) == 0
+    out = capsys.readouterr().out
+    assert "echo: hello" in out and "echo: again" in out and "echo: third" not in out
+    assert "[quota] Not sent: daily spend cap reached" in out
+    assert "spend today $1.20 of $1.00" in out
+    [start] = chat.starts()
+    assert "ANTHROPIC_API_KEY" in start["env"] and "CLAUDE_CODE_OAUTH_TOKEN" not in start["env"]
+
+
 def test_chat_overage_aborts_turn_quickly(chat, capsys):
     started = time.monotonic()
     assert chat.run(["OVERAGE", "hello", "/exit"]) == 0

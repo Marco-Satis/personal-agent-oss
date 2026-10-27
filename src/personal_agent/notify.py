@@ -335,7 +335,23 @@ def info_notice(code: str, language: str = "en") -> Callable[[Target], str]:
     return build
 
 
-NOTICE_FACTORIES = ("alert_notice", "info_notice", "task_counts_notice", "task_detail_notice")
+def spend_notice(percent: int, day_usd: float, cap_day: float, month_usd: float, cap_month: float,
+                 language: str = "en") -> Callable[[Target | None], str]:
+    """API spend against the caps (access mode "api"): numbers only, no prompt text."""
+    if language == "de":
+        text = (f"API-Kosten bei {int(percent)} % des Monatsdeckels: heute ${day_usd:.2f} von ${cap_day:.2f}, "
+                f"Monat ${month_usd:.2f} von ${cap_month:.2f}")
+    else:
+        text = (f"API spend at {int(percent)} % of the monthly cap: today ${day_usd:.2f} of ${cap_day:.2f}, "
+                f"this month ${month_usd:.2f} of ${cap_month:.2f}")
+
+    def build(target: Target | None) -> str:
+        return text
+
+    return build
+
+
+NOTICE_FACTORIES = ("alert_notice", "info_notice", "task_counts_notice", "task_detail_notice", "spend_notice")
 
 
 # --- routes --------------------------------------------------------------------

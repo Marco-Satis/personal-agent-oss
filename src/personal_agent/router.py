@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .bridge import MAX_PROMPT_CHARS, SKILL_TOOL, UnexpectedOutput
-from .quota import RESET_COMMAND, SUBSCRIPTION_KEY_SOURCE, QuotaGuard, is_overage
+from .quota import API_KEY_SOURCE, RESET_COMMAND, SUBSCRIPTION_KEY_SOURCE, QuotaGuard, is_overage
 from .statefiles import read_private_json, remove_private, write_private_json
 from .status import SessionStatus, clean_text, format_status_line, render_sessions, views_from_statuses
 from .textsafe import is_unsafe
@@ -402,7 +402,9 @@ def guarded_send(
 
     Raises UnsafeInput (nothing sent) when the body would run a slash command that is
     not allowlisted; the default allowlist is "/" plus session.config.allowed_skills.
-    Raises PaidUsageStop on an API key source or paid overage, and SafetyStop on any
+    Raises PaidUsageStop on an API key source or paid overage (access mode
+    "subscription"), SafetyStop when an "api" session reports any other access path,
+    and SafetyStop on any
     hook event, on an init event with unexpected tools, MCP servers, plugins or plugin
     skills, and on a Skill tool call outside session.config.allowed_skills. The caller
     then closes the session right away.
@@ -414,6 +416,7 @@ def guarded_send(
     """
     config = getattr(session, "config", None)
     allowed = frozenset(getattr(config, "allowed_skills", ()) or ())
+    api_mode = bool(getattr(config, "api_key", None))
     if slash_commands is None:
         slash_commands = frozenset("/" + name for name in allowed)
     problem = slash_problem(body, slash_commands)
@@ -430,7 +433,15 @@ def guarded_send(
                 raise SafetyStop("a hook ran inside the assistant session")
             if subtype == "init":
                 source = event.get("apiKeySource")
-                if source is not None and source != SUBSCRIPTION_KEY_SOURCE:
+                if api_mode:
+                    # The installation pays per token on purpose; anything else means a
+                    # second access path (a login) slipped in.
+                    if source != API_KEY_SOURCE:
+                        raise SafetyStop(
+                            f"Claude Code reports access '{clean_text(str(source), 40)}' "
+                            "instead of the configured API key"
+                        )
+                elif source is not None and source != SUBSCRIPTION_KEY_SOURCE:
                     reason = (
                         f"Claude Code reports API key source '{clean_text(source, 40)}', "
                         "which is billed per token instead of the subscription"
@@ -447,15 +458,19 @@ def guarded_send(
         elif kind == "rate_limit_event":
             info = event.get("rate_limit_info")
             guard.observe(info)
-            if is_overage(info):
+            if not api_mode and is_overage(info):
                 raise PaidUsageStop("paid overage is in use")
         if on_event is not None:
             on_event(event)
 
     try:
-        return session.send(body, on_event=wrapped)
+        result = session.send(body, on_event=wrapped)
     except UnexpectedOutput as exc:
         raise SafetyStop(str(exc)) from exc
+    record = getattr(guard, "record_cost", None)  # spend.SpendGuard (access mode "api")
+    if record is not None:
+        record(session, getattr(result, "cost_usd", None))
+    return result
 
 
 class Router:
