@@ -187,6 +187,7 @@ BRIEF_TELEGRAM_MODES = ("counts", "full")
 TASK_DISCORD_MODES = ("off", "counts")
 TASK_DETAIL_MODES = ("counts", "title")
 TELEGRAM_TASK_MODES = ("queue", "off")
+MAIL_TELEGRAM_MODES = ("off", "counts", "subjects", "full")
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off")
 
@@ -292,6 +293,13 @@ class Config:
     telegram_inbound: bool = True      # PA_TELEGRAM_INBOUND: chat over Telegram (approvals always work)
     telegram_tasks: str = "queue"      # PA_TELEGRAM_TASKS: queue | off (`task ...` from Telegram)
     telegram_max_turns_per_hour: int = 30  # PA_TELEGRAM_MAX_TURNS_PER_HOUR: model turns from Telegram
+    # PA_MAIL_CONFIG: the 0600 connector file with mail passwords; only the mail worker reads it.
+    mail_config: Path | None = None
+    mail_days: int = 7               # PA_MAIL_DAYS: window of `mail` (UID SEARCH SINCE)
+    mail_max_per_folder: int = 50    # PA_MAIL_MAX_PER_FOLDER: newest messages kept per folder
+    mail_timeout_s: int = 45         # PA_MAIL_TIMEOUT_S: one worker call
+    mail_cache_s: int = 300          # PA_MAIL_CACHE_S: `mail` reuses a fresher cache
+    mail_telegram: str = "counts"    # PA_MAIL_TELEGRAM: off | counts | subjects | full
 
     def route(self, kind: str) -> tuple[str, ...] | None:
         """The explicit PA_NOTIFY_<KIND> channels, or None for the default rule (notify.resolve_route)."""
@@ -434,6 +442,24 @@ class Config:
         spend_cap_day = _env_float("PA_SPEND_CAP_DAY_USD", min(3.0, spend_cap_month))
         if not 0 < spend_cap_day <= spend_cap_month:
             raise ConfigError("PA_SPEND_CAP_DAY_USD must be greater than 0 and at most PA_SPEND_CAP_MONTH_USD")
+        mail_config = _optional_path("PA_MAIL_CONFIG") if "mail" in modules else None
+        if mail_config is not None and not mail_config.is_absolute():
+            raise ConfigError("PA_MAIL_CONFIG must be an absolute path")
+        mail_days = _env_int("PA_MAIL_DAYS", 7)
+        if not 1 <= mail_days <= 60:
+            raise ConfigError("PA_MAIL_DAYS must be between 1 and 60")
+        mail_max_per_folder = _env_int("PA_MAIL_MAX_PER_FOLDER", 50)
+        if not 10 <= mail_max_per_folder <= 100:
+            raise ConfigError("PA_MAIL_MAX_PER_FOLDER must be between 10 and 100")
+        mail_timeout_s = _env_int("PA_MAIL_TIMEOUT_S", 45)
+        if not 10 <= mail_timeout_s <= 180:
+            raise ConfigError("PA_MAIL_TIMEOUT_S must be between 10 and 180 seconds")
+        mail_cache_s = _env_int("PA_MAIL_CACHE_S", 300)
+        if not 0 <= mail_cache_s <= 3600:
+            raise ConfigError("PA_MAIL_CACHE_S must be between 0 and 3600 seconds")
+        mail_telegram = (_env("PA_MAIL_TELEGRAM", "counts") or "counts").lower()
+        if mail_telegram not in MAIL_TELEGRAM_MODES:
+            raise ConfigError("PA_MAIL_TELEGRAM must be 'off', 'counts', 'subjects' or 'full'")
 
         return cls(
             state_dir=state_dir,
@@ -494,6 +520,12 @@ class Config:
             telegram_inbound=_env_bool("PA_TELEGRAM_INBOUND", True),
             telegram_tasks=telegram_tasks,
             telegram_max_turns_per_hour=telegram_max_turns,
+            mail_config=mail_config,
+            mail_days=mail_days,
+            mail_max_per_folder=mail_max_per_folder,
+            mail_timeout_s=mail_timeout_s,
+            mail_cache_s=mail_cache_s,
+            mail_telegram=mail_telegram,
         )
 
     def validate_for_serve(self) -> None:

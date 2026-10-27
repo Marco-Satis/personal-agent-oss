@@ -32,6 +32,7 @@ read back, because the assistant can write the vault.
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import fcntl
 import hashlib
@@ -116,6 +117,7 @@ TEXTS = {
         "tasks": "Open tasks",
         "sessions": "Claude Code sessions",
         "quota": "Quota",
+        "mail": "Mail",
         "inbox": "Inbox",
         "empty": "(empty)",
         "none": "(none)",
@@ -133,6 +135,7 @@ TEXTS = {
         "tasks": "Offene Aufgaben",
         "sessions": "Claude-Code-Sessions",
         "quota": "Kontingent",
+        "mail": "Mail",
         "inbox": "Eingang",
         "empty": "(leer)",
         "none": "(keine)",
@@ -196,6 +199,30 @@ class BriefData:
     quota: str
     captures: int
     since_text: str
+    mail: str = ""  # one line from the mail cache (categories, mailbox problems); "" without mail
+
+
+def mail_summary(config: "Config", now_ts: float) -> str:
+    """Categories of the cached mails and mailbox problems, from the cache only (no network)."""
+    if getattr(config, "mail_config", None) is None:
+        return ""
+    try:
+        from .mail import MailCache
+        from .mailtriage import category_counts, health_notes, label
+
+        view = MailCache(config.state_dir).load()
+    except Exception as exc:  # noqa: BLE001 - the brief never fails because of mail
+        log.warning("brief: mail cache unreadable (%s)", type(exc).__name__)
+        return ""
+    if view.checked_at is None and not view.accounts:
+        return ""
+    messages = [m for m in view.messages() if not m.seen]
+    parts = [f"{label(c, config.language)} {n}" for c, n in category_counts((m.subject, m.is_list, m.is_auto)
+                                                                         for m in messages)]
+    text = (", ".join(parts) or "0") + (" unread" if config.language != "de" else " ungelesen")
+    notes = health_notes(view, now_ts, config.language)
+    return text + ("" if not notes else " · " + " · ".join(notes))
+
 
 
 def _texts(language: str) -> dict[str, str]:
@@ -262,7 +289,10 @@ def render_markdown(data: BriefData, language: str = "en") -> str:
     else:
         lines.append(_counts_text(data))
         lines += [f"- {format_status_line(s, data.now_ts).rstrip()}" for s in data.statuses]
-    lines += ["", f"## {t['quota']}", data.quota, "", f"## {t['inbox']}"]
+    lines += ["", f"## {t['quota']}", data.quota]
+    if data.mail:
+        lines += ["", f"## {t['mail']}", data.mail]
+    lines += ["", f"## {t['inbox']}"]
     if data.has_vault:
         lines.append(t["captures"].format(n=data.captures, since=data.since_text))
     else:
@@ -305,6 +335,7 @@ def render_discord(data: BriefData, language: str, mode: str, full_path: str,
             f"{t['tasks']}: {tasks}",
             f"{t['sessions']}: {_counts_text(data) or t['no_status']}",
             f"{t['quota']}: {_discord_plain(data.quota)}",
+            *([f"{t['mail']}: {_discord_plain(data.mail)}"] if data.mail else []),
             f"{t['inbox']}: {inbox}",
             footer,
         ])
@@ -337,7 +368,10 @@ def render_discord(data: BriefData, language: str, mode: str, full_path: str,
             f"- {s.state} · {discord_line(s.project, 48)}" + (f" · {discord_line(s.summary, 120)}" if s.summary else "")
             for s in data.statuses
         ]
-    lines += ["", f"**{t['quota']}**", _discord_plain(data.quota), "", f"**{t['inbox']}**"]
+    lines += ["", f"**{t['quota']}**", _discord_plain(data.quota)]
+    if data.mail:
+        lines += ["", f"**{t['mail']}**", _discord_plain(data.mail)]
+    lines += ["", f"**{t['inbox']}**"]
     lines.append(t["captures"].format(n=data.captures, since=data.since_text) if data.has_vault else t["no_vault"])
     lines.append(footer)
     return "\n".join(lines)
@@ -372,6 +406,7 @@ def render_plain(data: BriefData, language: str, mode: str, full_path: str, poli
             f"{t['tasks']}: {tasks}",
             f"{t['sessions']}: {_counts_text(data) or t['no_status']}",
             f"{t['quota']}: {_plain(data.quota)}",
+            *([f"{t['mail']}: {_plain(data.mail)}"] if data.mail else []),
             f"{t['inbox']}: {inbox}",
             footer,
         ])
@@ -395,7 +430,10 @@ def render_plain(data: BriefData, language: str, mode: str, full_path: str, poli
         if data.task_total > len(data.tasks):
             lines.append(t["more"].format(n=data.task_total - len(data.tasks)))
     lines += ["", t["sessions"], _counts_text(data) or t["no_status"]]
-    lines += ["", t["quota"], _plain(data.quota), "", t["inbox"]]
+    lines += ["", t["quota"], _plain(data.quota)]
+    if data.mail:
+        lines += ["", t["mail"], _plain(data.mail)]
+    lines += ["", t["inbox"]]
     lines.append(t["captures"].format(n=data.captures, since=data.since_text) if data.has_vault else t["no_vault"])
     lines.append(footer)
     return "\n".join(lines)
@@ -810,6 +848,9 @@ def _run_locked(config: "Config", now: datetime, send: bool, polish: bool, by: s
     guard = make_guard(config)  # fresh: sees the chat's usage
     statuses = read_statuses(config.status_dir, config.status_max_age_min, now=ts)
     data = collect_brief(vault, guard, statuses, now, since, config.language)
+    summary = mail_summary(config, ts)
+    if summary:
+        data = dataclasses.replace(data, mail=summary)
     text = render_markdown(data, config.language)
     name = f"brief-{today}.md"
     written = _write_output(vault, name, text, note)

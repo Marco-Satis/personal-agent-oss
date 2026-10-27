@@ -34,6 +34,8 @@ MODULES: tuple[Module, ...] = (
     Module("tasks", "both", "background helpers and the task board", "PA_TASK", notify_kinds=("task_done",)),
     Module("domains", "private", "subject areas with their own notes", "PA_DOMAIN_"),
     Module("telegram", "both", "Telegram bot: notices, approvals, chat", "PA_TELEGRAM_"),
+    Module("mail", "both", "read mail, sort it, payment check, reply drafts (never sends)", "PA_MAIL_",
+           needs=("imap",)),
 )
 NAMES = tuple(m.name for m in MODULES)
 

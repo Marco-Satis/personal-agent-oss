@@ -99,6 +99,26 @@ def plain_line(text: object, limit: int = 160) -> str:
     return defang(flat)
 
 
+_TG_COMMAND = re.compile(r"(^|[\s(\[{\"'«“‚„<>|,;:!?])/(?=\w)")
+_TG_MENTION = re.compile(r"@(?=[A-Za-z0-9_])")
+_TG_DOMAIN = re.compile(r"(?<![\w.-])(?:[\w-]+\.)+(?:[^\W\d_]{2,}|xn--[\w-]+)(?![\w-])", re.UNICODE)
+
+
+def telegram_untrusted(text: object, limit: int = 160) -> str:
+    """Third-party text (mail subjects, senders, bodies, calendar titles) as one inert
+    Telegram line.
+
+    Telegram turns '/word' in a bot message into a tappable bot command (a tap sends
+    it as the owner), '@name' into a mention and bare domains into links. On top of
+    plain_line: '/' at the start of a token becomes U+2215, '@' before a name character
+    becomes U+FF20, and the dots of domain-like tokens become '[.]'.
+    """
+    flat = plain_line(text, limit)
+    flat = _TG_COMMAND.sub(lambda m: m.group(1) + "∕", flat)
+    flat = _TG_MENTION.sub("＠", flat)
+    return _TG_DOMAIN.sub(lambda m: m.group().replace(".", "[.]"), flat)
+
+
 def channel_limits(name: str) -> tuple[int, int, Callable[[str], int]]:
     """(limit, max_chunks, measure) of a channel."""
     if name == "telegram":
@@ -601,5 +621,5 @@ __all__ = [
     "ASYNC_KINDS", "DISCORD_LIMIT", "DISCORD_MAX_CHUNKS", "KINDS", "TARGET_NAMES", "TELEGRAM_LIMIT",
     "TELEGRAM_MAX_CHUNKS", "DiscordTarget", "Notifier", "NotifierPost", "Target", "alert_notice", "alert_outcome",
     "channel_limits", "defang", "discord_line", "discord_safe", "info_notice", "plain_line", "render_approval_notice",
-    "resolve_route", "split_message", "task_counts_notice", "task_detail_notice", "utf16_len",
+    "resolve_route", "split_message", "task_counts_notice", "task_detail_notice", "telegram_untrusted", "utf16_len",
 ]

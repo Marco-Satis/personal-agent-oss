@@ -583,6 +583,57 @@ def _cmd_safety(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mail(config: Config, args: argparse.Namespace) -> int:
+    """Check the mail setup: names, folders and switches, never a user, address, URL or password."""
+    from .mail import WorkerClient, WorkerError
+    from .mailconfig import file_problem
+
+    if config.mail_config is None:
+        print("mail is not configured (PA_MAIL_CONFIG)")
+        return 2
+    problem = file_problem(config.mail_config)
+    if problem:
+        print(f"mail config: {problem}")
+        return 2
+    vault_problem = _workdir_problem(config, config.vault_path, config.bridge_paths()[1])
+    if vault_problem and "mail config" in vault_problem:
+        print(f"mail config: {vault_problem}")
+        return 2
+    worker = WorkerClient(config.mail_config, config.mail_timeout_s, run_dir=config.state_dir / "run")
+    roots = [str(config.vault_path.expanduser().resolve()), str(config.state_dir.expanduser().resolve())]
+    try:
+        described = worker.call("describe", {})
+    except WorkerError as exc:
+        print(f"mail config: {exc.detail or exc.code}")
+        return 2 if exc.code == "config" else 1
+    for account in described.get("accounts") or []:
+        if not isinstance(account, dict):
+            continue
+        folders = ", ".join(clean_text(f, 60) for f in account.get("folders") or [] if isinstance(f, str))
+        print(f"account {clean_text(account.get('name'), 24)}: folders {folders}"
+              f"{' · draft saving allowed' if account.get('allow_draft_append') is True else ''}")
+    for calendar in described.get("calendars") or []:
+        if isinstance(calendar, dict):
+            print(f"calendar {clean_text(calendar.get('name'), 24)}")
+    try:
+        result = worker.call("check", {"connect": bool(args.connect), "forbidden_roots": roots})
+    except WorkerError as exc:
+        print(f"check failed: {exc.code}")
+        return 1
+    ok = True
+    for entry in result.get("accounts") or []:
+        if isinstance(entry, dict):
+            code = clean_text(entry.get("code"), 24)
+            ok = ok and code == "ok"
+            print(f"{clean_text(entry.get('account'), 24)}: {code}")
+    for entry in result.get("calendars") or []:
+        if isinstance(entry, dict):
+            print(f"{clean_text(entry.get('calendar'), 24)} (calendar): {clean_text(entry.get('code'), 24)}")
+    if not args.connect:
+        print("(no connection made; use --connect to log in and check every folder)")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="personal-agent", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -658,6 +709,12 @@ def build_parser() -> argparse.ArgumentParser:
     safety_sub = safety.add_subparsers(dest="safety_command", required=True)
     safety_sub.add_parser("status", help="show the safety stop")
     safety_sub.add_parser("clear", help="clear the safety stop (terminal only)")
+
+    mail = sub.add_parser("mail", help="the read-only mail reader (PA_MAIL_CONFIG)")
+    mail_sub = mail.add_subparsers(dest="mail_command", required=True)
+    mail_check = mail_sub.add_parser("check", help="check the mail config (names only; --connect logs in)")
+    mail_check.add_argument("--connect", action="store_true",
+                            help="log in to every account and check every folder (read-only)")
     return parser
 
 
@@ -674,6 +731,7 @@ COMMANDS = {
     "telegram": _cmd_telegram,
     "safety": _cmd_safety,
     "modules": _cmd_modules,
+    "mail": _cmd_mail,
 }
 
 

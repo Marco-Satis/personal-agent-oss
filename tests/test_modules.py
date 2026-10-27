@@ -27,15 +27,15 @@ def test_manifests_are_consistent():
 
 @pytest.mark.parametrize("raw,expected", [
     (None, NAMES), ("", NAMES), ("all", NAMES), ("none", ()),
-    ("telegram, BRIEF", ("brief", "telegram")), ("tasks,tasks", ("tasks",)),
+    ("telegram, BRIEF", ("brief", "telegram")), ("tasks,tasks", ("tasks",)), ("mail", ("mail",)),
 ])
 def test_parse_modules(raw, expected):
     assert parse_modules(raw) == expected
 
 
 def test_unknown_module_is_an_error(env):
-    env.setenv("PA_MODULES", "brief,mail")
-    with pytest.raises(ConfigError, match="unknown module.*mail"):
+    env.setenv("PA_MODULES", "brief,calendar")
+    with pytest.raises(ConfigError, match="unknown module.*calendar"):
         Config.from_env()
 
 

@@ -1024,7 +1024,7 @@ def build_telegram_runtime(config: "Config", inbox: ApprovalInbox | None,
                             allow_add=config.telegram_tasks == "queue")
     try:
         runtime = finish_assistant(parts, tasks=tasks, delegation=False, sessions=None, model=None,
-                                   local_listings=False, note_source="telegram")
+                                   local_listings=False, note_source="telegram", channel="telegram")
     except AssistantError:
         parts.broker.close()
         raise

@@ -528,6 +528,34 @@ one tap: it confirms intent, it is not a security boundary against someone holdi
 There is deliberately no setting for another API address: a test server address left in a real `.env`
 would send the token in clear text to whatever local process holds that port.
 
+### Mail
+
+The assistant reads your mailboxes, sorts them and warns you; **it never sends, deletes, moves or marks
+anything as read**. Passwords live only in a separate connector file (`PA_MAIL_CONFIG`, mode 0600, outside
+the vault); only a short-lived worker process (`python -I -S`, minimal environment) ever opens it. IMAP runs
+over implicit TLS only, with `EXAMINE` and `BODY.PEEK` so nothing changes on the server.
+
+```json
+{"version": 1,
+ "accounts": [{"name": "work", "host": "imap.example.org", "port": 993, "user": "me@example.org",
+               "password": "<app password>", "folders": ["INBOX"],
+               "address": "me@example.org", "drafts_folder": "Drafts", "allow_draft_append": true}]}
+```
+
+| Command | What it does |
+|---|---|
+| `mail` | counts per folder, mails per category (deadline/legal, invoice/payment, complaint, request, confidential, newsletter), the latest mails, and mailbox problems |
+| `mail refresh` | checks the server now (rate-limited) |
+| `mail show <id>` | one mail as plain text, marked as data, with warning signals and a **payment check**: every IBAN is shown masked and compared with the bank accounts this sender used before (new or changed account = check by phone before paying) |
+| `mail trust <id>` | confirm the bank account in this mail after you checked it |
+| `mail draft <id>` | puts the reply in `outputs/drafts/<id>.md` (the assistant writes it there, with your approval) into the account's drafts folder; you send it yourself from your mail program |
+
+Sorting uses fixed rules, not a model, so a mail can never talk its way into another category. Mailbox
+health shows up in `mail` and in the morning brief: a failed login (often a changed app password), a check
+that is hours old, or several working days without any new mail. A dead login must never look like a quiet
+inbox. Drafts need `"allow_draft_append": true` for the account; that worker session may additionally use
+`LIST` and `APPEND` (with the `\Draft` flag), nothing else.
+
 ## Connect your Claude Code sessions
 
 Your sessions report their state through a small hook (standard library only) that writes one status

@@ -17,6 +17,9 @@ notes. A message that starts with "/" would be expanded by Claude Code as a
 slash command (built-in ones such as /config or /clear included), so the final
 body of every turn may start with "/" only for an allowlisted plugin command.
 
+"mail", "mail refresh" and "mail show <id>" are tier 1 too (mail.py): read-only, no
+model, and on Telegram limited by PA_MAIL_TELEGRAM (the Router knows its channel).
+
 Every turn goes through `guarded_send`, which watches the stream and stops the
 turn on paid usage, on any hook event, on an init event that lists unexpected
 tools, MCP servers or plugins, and on a Skill tool call outside the allowlist.
@@ -34,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .bridge import MAX_PROMPT_CHARS, SKILL_TOOL, UnexpectedOutput
+from .mail import NOT_CONFIGURED, MailCommand, parse_mail_command
 from .quota import API_KEY_SOURCE, RESET_COMMAND, SUBSCRIPTION_KEY_SOURCE, QuotaGuard, is_overage
 from .statefiles import read_private_json, remove_private, write_private_json
 from .status import SessionStatus, clean_text, format_status_line, render_sessions, views_from_statuses
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
     from .bridge import ClaudeSession, TurnResult
     from .coordinator import TaskService
     from .domains import Domains
+    from .mail import MailService
 
 log = logging.getLogger(__name__)
 
@@ -493,8 +498,13 @@ class Router:
         sessions: Callable[[], str] | None = None,
         local_listings: bool = True,
         note_source: str | None = None,
+        channel: str = "console",
+        mail: "MailService | None" = None,
     ) -> None:
         self.main = main
+        # Trusted: "telegram" for serve's Telegram assistant. Mail output follows PA_MAIL_TELEGRAM there.
+        self.channel = "telegram" if channel == "telegram" else "console"
+        self.mail = mail  # None: PA_MAIL_CONFIG is not set
         self.note_source = note_source  # trusted: "telegram" marks notes captured over Telegram
         self.small = small if config.small_model else None
         self.guard = guard
@@ -558,7 +568,22 @@ class Router:
                 "Domains (memory per topic for tasks, wiki/domains/<name>.md): domains lists them; "
                 "domain <name> shows one."
             )
+        if self.mail is not None:
+            line = self.mail.help_line(self.channel)
+            if line:
+                lines.append(line)
         return "\n".join(lines)
+
+    def _mail_command(self, command: MailCommand) -> Reply:
+        """Tier 1: no model, no quota, works while halted. Never sends anything."""
+        if self.mail is None:
+            return Reply(NOT_CONFIGURED, 1, is_error=True)
+        try:
+            text, is_error = self.mail.command(command, self.channel)
+        except Exception as exc:  # noqa: BLE001 - a broken mail setup must not end the chat
+            log.warning("mail command failed: %s", type(exc).__name__)
+            return Reply(f"mail unavailable: {type(exc).__name__}", 1, is_error=True)
+        return Reply(text, 1, is_error=is_error)
 
     def _domain_command(self, command: "Command") -> Reply:
         if command.kind == "domain_usage":
@@ -642,7 +667,8 @@ class Router:
 
     def is_tier1(self, text: str) -> bool:
         """Whether handle(text) answers without any model (notes, task commands, fixed answers)."""
-        if prefix_command(text) is not None or parse_command(text) is not None:
+        if prefix_command(text) is not None or parse_command(text) is not None \
+                or parse_mail_command(text) is not None:
             return True
         tier, body = choose_tier(text, self.config)
         return tier == 1 or not body or slash_problem(body, self.slash_commands) is not None
@@ -654,6 +680,9 @@ class Router:
         command = parse_command(text)
         if command is not None:
             return self._task_command(command)  # tier 1: no quota, works while halted
+        mail_command = parse_mail_command(text)
+        if mail_command is not None:
+            return self._mail_command(mail_command)
         tier, body = choose_tier(text, self.config)
         if tier == 1:
             return Reply(self._fixed(body), 1)

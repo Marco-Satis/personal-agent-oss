@@ -38,9 +38,11 @@ def _subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.Argument
 def test_cli_has_no_command_that_sends_to_a_session():
     commands = _subcommands(build_parser())
     assert set(commands) == set(COMMANDS) == {
-        "serve", "escalate", "status", "simulate", "chat", "vault", "plugins", "brief", "hooks", "telegram", "safety", "modules"}
+        "serve", "escalate", "status", "simulate", "chat", "vault", "plugins", "brief", "hooks", "telegram", "safety",
+        "modules", "mail"}
     assert set(_subcommands(commands["telegram"])) == {"pair", "status", "unpair"}
     assert set(_subcommands(commands["hooks"])) == {"snippet"}
+    assert set(_subcommands(commands["mail"])) == {"check"}  # read-only: nothing that sends mail
 
 
 def test_chat_commands_have_no_session_send_kind():
@@ -52,6 +54,17 @@ def test_chat_commands_have_no_session_send_kind():
     kinds = {cmd.kind for cmd in map(parse_command, corpus) if cmd is not None}
     assert kinds <= known
     assert not any("send" in kind or "reply" in kind for kind in kinds)
+
+
+def test_mail_commands_have_no_send_or_reply_kind():
+    from personal_agent.mail import parse_mail_command
+
+    corpus = ["mail", "mail refresh", "mail show 3f2a9c", "mail send 3f2a9c", "mail reply 3f2a9c ok",
+              "reply 3f2a9c ok", "mail forward 3f2a9c x@example.org", "mail delete 3f2a9c", "mail move 3f2a9c x",
+              "mail zeige 3f2a9c", "mail show 3F2A9C", "mail show xyz"]
+    kinds = {cmd.kind for cmd in map(parse_mail_command, corpus) if cmd is not None}
+    assert kinds == {"mail_overview", "mail_refresh", "mail_show", "mail_usage"}
+    assert not any(word in kind for kind in kinds for word in ("send", "reply", "forward", "delete", "move"))
 
 
 def test_readme_and_concept_point_to_the_snippet_and_the_design():

@@ -9,7 +9,8 @@ vault context). Only the approval channel, the trusted label of the main scope
 
 - the Telegram assistant never offers delegation and gets no agents listing;
 - its Router lists no local sessions (`status` and `sessions` stay in the terminal);
-- notes it captures carry a "[via telegram]" marker.
+- notes it captures carry a "[via telegram]" marker;
+- its Router has channel "telegram", so mail commands follow PA_MAIL_TELEGRAM.
 
 `prepare_assistant` builds everything up to the running broker; the caller then
 starts its task service (the chat) or a board-only one (serve) and calls
@@ -54,7 +55,8 @@ CHAT_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "Skill")
 
 STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json",
                  "tasks.json", "tasks.lock", "tasks-owner.lock", "telegram-owner.json", "telegram-pairing.json",
-                 "telegram-offset.json", "telegram.lock", "safety-stop.json", "approval-pinlock.json")
+                 "telegram-offset.json", "telegram.lock", "safety-stop.json", "approval-pinlock.json",
+                 "mail-cache.json", "mail.lock")
 DELEGATION_PROMPT = """
 You can queue background work with the tool mcp__pa__delegate_task (text up to 300 characters,
 optional domain). Use it only when the person asks for background work. The person must approve
@@ -144,6 +146,9 @@ def workdir_problem(config: Config, workdir: Path, config_dir: Path) -> str | No
     checks += [(f"the state file {name}", config.state_dir / name) for name in STATE_ENTRIES]
     if core is not None:
         checks.append(("the core plugin directory", core))
+    if config.mail_config is not None:
+        # The assistant can read the vault: the file with mail passwords must never be in it.
+        checks.append(("the mail config file", config.mail_config))
     checks += [("the Python interpreter or its packages", p) for p in _python_paths()]
     if claude_bin:
         checks.append(("the Claude Code binary", Path(claude_bin)))
@@ -281,12 +286,13 @@ class AssistantRuntime:
 
 def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", delegation: bool,
                      sessions: Callable[[], str] | None, model: str | None, local_listings: bool = True,
-                     note_source: str | None = None) -> AssistantRuntime:
+                     note_source: str | None = None, channel: str = "console") -> AssistantRuntime:
     """Write the system prompt and create the sessions and the Router. Raises AssistantError
     (the caller closes its task service and the broker)."""
     from .approval import PERMISSION_TOOL
     from .approval_server import SERVER_NAME
     from .bridge import DEFAULT_TURN_TIMEOUT_S, DELEGATE_TOOL, BridgeConfig, ClaudeSession
+    from .mail import MailService
     from .router import Router, RouterConfig
     from .vault import VAULT_SYSTEM_PROMPT
 
@@ -354,6 +360,9 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
         sessions=sessions,
         local_listings=local_listings,
         note_source=note_source,
+        channel=channel,
+        # Tier-1 mail commands: the config file is only lstat'ed here; the worker process reads it.
+        mail=MailService.from_config(config),
     )
     return AssistantRuntime(parts, main_session, small_session, router)
 
