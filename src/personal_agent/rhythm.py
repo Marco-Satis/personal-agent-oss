@@ -37,7 +37,7 @@ STATE_FILE = "rhythm.json"
 STATE_VERSION = 1
 GRACE_S = 60 * 60
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-NEEDS_PERSON = ("deadline", "complaint", "request")
+NEEDS_PERSON = ("call", "deadline", "complaint", "request")
 
 TEXTS = {
     "en": {"midday": "Midday update", "evening": "Evening update", "weekly": "Weekly review, week {week}",

@@ -551,7 +551,7 @@ over implicit TLS only, with `EXAMINE` and `BODY.PEEK` so nothing changes on the
 
 | Command | What it does |
 |---|---|
-| `mail` | counts per folder, mails per category (deadline/legal, invoice/payment, complaint, request, confidential, newsletter), the latest mails, and mailbox problems |
+| `mail` | counts per folder, mails per category (call back from a phone service, deadline/legal, invoice/payment, complaint, request, confidential, newsletter), the latest mails, and mailbox problems |
 | `mail refresh` | checks the server now (rate-limited) |
 | `mail show <id>` | one mail as plain text, marked as data, with warning signals and a **payment check**: every IBAN is shown masked and compared with the bank accounts this sender used before (new or changed account = check by phone before paying) |
 | `mail trust <id>` | confirm the bank account in this mail after you checked it |

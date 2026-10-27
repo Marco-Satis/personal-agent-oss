@@ -86,6 +86,8 @@ def first_ref(svc):
     ("Hallo zusammen", {}, "other"),
     ("Kurz Bescheid wegen morgen", {}, "other"),
     ("Invoice #12 overdue", {}, "deadline"),
+    ("Neue Sprachnachricht auf Ihrem Anrufbeantworter", {"is_auto": True}, "call"),
+    ("Anrufzusammenfassung: Rückrufbitte Herr Muster", {}, "call"),
 ])
 def test_classify(subject, flags, expected):
     assert classify(subject, **flags) == expected

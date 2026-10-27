@@ -29,18 +29,22 @@ from typing import Iterable
 
 from .statefiles import read_private_json, write_private_json
 
-CATEGORIES = ("deadline", "payment", "complaint", "request", "confidential", "automated", "other")
+CATEGORIES = ("call", "deadline", "payment", "complaint", "request", "confidential", "automated", "other")
 LABELS = {
-    "en": {"deadline": "deadline/legal", "payment": "invoice/payment", "complaint": "complaint",
+    "en": {"call": "call back", "deadline": "deadline/legal", "payment": "invoice/payment", "complaint": "complaint",
            "request": "request", "confidential": "confidential", "automated": "newsletter/automatic",
            "other": "other"},
-    "de": {"deadline": "Frist/Recht", "payment": "Rechnung/Zahlung", "complaint": "Reklamation",
+    "de": {"call": "Rückruf", "deadline": "Frist/Recht", "payment": "Rechnung/Zahlung", "complaint": "Reklamation",
            "request": "Anfrage", "confidential": "Vertraulich", "automated": "Newsletter/automatisch",
            "other": "Sonstiges"},
 }
 
 # Word stems (German and English), matched at a word start, case-insensitive.
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Call summaries and voicemail transcripts from a phone service: someone wants a call back.
+    ("call", ("anrufbeantworter", "sprachnachricht", "voicemail", "mailbox-nachricht", "verpasster anruf",
+              "anruf von", "rückrufbitte", "rueckrufbitte", "rückruf", "missed call", "call summary",
+              "gesprächszusammenfassung", "anrufzusammenfassung")),
     ("deadline", ("frist", "mahnung", "mahnbescheid", "kündigung", "kuendigung", "widerspruch", "steuerbescheid",
                   "gericht", "anwalt", "rechtsanwalt", "abmahnung", "vollstreckung", "inkasso", "letzte erinnerung",
                   "zahlungserinnerung", "deadline", "final notice", "overdue", "legal notice", "court")),
@@ -63,6 +67,8 @@ def classify(subject: str, *, is_list: bool = False, is_auto: bool = False) -> s
     text = subject or ""
     for category, pattern in _PATTERNS:
         if pattern.search(text):
+            if category == "call":
+                return category  # phone services send these automatically; they still need a person
             # Newsletters say "Angebot" all the time: a list mail is never a request.
             if category == "request" and (is_list or is_auto):
                 return "automated"
