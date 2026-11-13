@@ -291,6 +291,7 @@ class Config:
     task_quota_stop: float = 0.8     # PA_TASK_QUOTA_STOP, at most quota_stop
     task_discord: str = "off"        # PA_TASK_DISCORD: off | counts
     task_delegation: bool = False    # PA_TASK_DELEGATION
+    time_note: bool = True           # PA_TIME_NOTE: time, gap and events in front of each model turn
     task_max_age_h: int = 24         # PA_TASK_MAX_AGE_H: older queued tasks expire
     domain_context_chars: int = 4000  # PA_DOMAIN_CONTEXT_CHARS: domain notes per helper prompt, 0 = none
     sessions_source: str = "hooks"   # PA_SESSIONS_SOURCE: hooks | agents | both (chat `sessions` only)
@@ -542,6 +543,7 @@ class Config:
             task_quota_stop=task_quota_stop,
             task_discord=task_discord,
             task_delegation=_env_bool("PA_TASK_DELEGATION", False),
+            time_note=_env_bool("PA_TIME_NOTE", True),
             task_max_age_h=task_max_age_h,
             domain_context_chars=domain_context_chars,
             sessions_source=sessions_source,

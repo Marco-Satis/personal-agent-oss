@@ -47,6 +47,7 @@ from .vault import Vault, VaultError, render_context
 
 if TYPE_CHECKING:
     from .bridge import ClaudeSession, TurnResult
+    from .timeaware import TimeAwareness
     from .coordinator import TaskService
     from .domains import Domains
     from .mail import MailService
@@ -500,8 +501,10 @@ class Router:
         note_source: str | None = None,
         channel: str = "console",
         mail: "MailService | None" = None,
+        time_awareness: "TimeAwareness | None" = None,
     ) -> None:
         self.main = main
+        self.time_awareness = time_awareness  # None: no time note (tests, PA_TIME_NOTE=off)
         # Trusted: "telegram" for serve's Telegram assistant. Mail output follows PA_MAIL_TELEGRAM there.
         self.channel = "telegram" if channel == "telegram" else "console"
         self.mail = mail  # None: PA_MAIL_CONFIG is not set
@@ -717,6 +720,9 @@ class Router:
             body, count = self._with_context(body)
             if count and self.on_context is not None:
                 self.on_context(CONTEXT_MARKER)
+        if self.time_awareness is not None and not slash:
+            # Time, gap since the last message and what happened since, in front of the turn.
+            body = f"{self.time_awareness.note()}\n{body}"
         if slash:
             # Skills otherwise date notes "00:00": the model has no clock of its own. The time
             # goes after the command, so the CLI still sees the leading "/" and the skill gets

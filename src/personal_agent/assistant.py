@@ -36,6 +36,7 @@ import personal_agent
 
 from .config import Config
 from .status import clean_text, read_statuses
+from .timeaware import TimeAwareness
 
 if TYPE_CHECKING:
     from .approval import ApprovalBroker, ApprovalChannel
@@ -363,6 +364,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
         channel=channel,
         # Tier-1 mail commands: the config file is only lstat'ed here; the worker process reads it.
         mail=MailService.from_config(config),
+        time_awareness=TimeAwareness(config.state_dir, channel) if config.time_note else None,
     )
     return AssistantRuntime(parts, main_session, small_session, router)
 

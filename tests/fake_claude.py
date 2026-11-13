@@ -73,8 +73,16 @@ def emit(obj):
     sys.stdout.flush()
 
 
+def without_time_note(text):
+    """The router's time note (timeaware.py) is context, not part of the message: drop it."""
+    if text.startswith("[time: ") and "]\n" in text:
+        return text.split("]\n", 1)[1]
+    return text
+
+
 def command_of(text):
     """The command in a message: the body of the last user-message/delegated-request block."""
+    text = without_time_note(text)
     blocks = _BLOCK.findall(text)
     if not blocks:
         return text
@@ -219,7 +227,7 @@ def main():
         if text == "HOOK":
             emit({"type": "system", "subtype": "hook_started", "hook_event": "SessionStart", "session_id": session})
         denials = []
-        answer = f"echo: {raw}"
+        answer = f"echo: {without_time_note(raw)}"
         if text.startswith(("SLEEP ", "SLEEP_NOTERM ")):
             if text.startswith("SLEEP_NOTERM "):
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)

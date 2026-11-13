@@ -1101,3 +1101,19 @@ def test_chat_with_tasks_off(chat, capsys, monkeypatch):
     assert chat.run(["task x", "/exit"]) == 0
     assert "agent[1]> tasks are off (PA_TASKS=off)" in capsys.readouterr().out
     assert not (chat.state / "tasks.json").exists()
+
+
+def test_time_note_goes_in_front_of_model_turns_but_not_plugin_commands(tmp_path):
+    from personal_agent.timeaware import TimeAwareness, record_event
+
+    clock = [1_700_000_000.0]
+    main, small = StubSession("main"), StubSession("small")
+    router = make_router(main, small)
+    router.time_awareness = TimeAwareness(tmp_path, "console", lambda: clock[0])
+    router.handle("!please summarize the week")
+    first = main.sent[-1]
+    assert first.startswith("[time: ") and first.endswith("]\nplease summarize the week")
+    record_event(tmp_path, "mail.new", "request", now=clock[0] + 60)
+    clock[0] += 3600
+    router.handle("!and now?")
+    assert "1 h since the last message" in main.sent[-1] and "since then: 1 new mail (1 request)" in main.sent[-1]
