@@ -74,3 +74,43 @@ def test_log_is_capped(tmp_path, monkeypatch):
         record_event(tmp_path, "mail.new", now=ts(9) + i)
     assert len(read_events(tmp_path, 0)) <= 60
     assert read_events(tmp_path, 0)[-1]["ts"] == ts(9) + 99
+
+
+# --- event sources ---------------------------------------------------------------------------
+
+
+def _mail_record(uid, subject):
+    return {"uid": uid, "date": ts(9), "flags": {"seen": False, "answered": False}, "size": 100,
+            "from_name": "Alice", "from_addr": "alice@example.org", "subject": subject, "list": False, "auto": False}
+
+
+def _scan(records, uidnext, uidvalidity=7):
+    folder = {"uidvalidity": uidvalidity, "uidnext": uidnext, "messages": len(records), "unseen": len(records),
+              "records": records}
+    return {"ok": True, "errors": [], "accounts": [{"name": "work", "error": None, "folders": {"INBOX": folder}}]}
+
+
+def test_mail_scan_records_only_newly_arrived_mail_with_its_category(tmp_path):
+    from personal_agent.mail import MailCache
+
+    cache = MailCache(tmp_path, clock=lambda: ts(9))
+    old = [_mail_record(1, "Hallo zusammen"), _mail_record(2, "Ihre Rechnung Oktober")]
+    cache.merge_scan(_scan(old, uidnext=3))
+    assert read_events(tmp_path, 0) == []  # the first look at a folder is not "new mail"
+    cache.merge_scan(_scan(old + [_mail_record(3, "Anfrage Kostenvoranschlag"), _mail_record(4, "Rechnung 12")], 5))
+    assert summarize(read_events(tmp_path, 0)) == "2 new mails (1 payment, 1 request)"
+    cache.merge_scan(_scan([_mail_record(9, "Anfrage")], 10, uidvalidity=8))  # folder ids changed: no flood
+    assert len(read_events(tmp_path, 0)) == 2
+
+
+def test_finished_helper_tasks_are_recorded(tmp_path):
+    from types import SimpleNamespace
+
+    from personal_agent.coordinator import Coordinator, TaskEvent
+
+    seen = []
+    coordinator = Coordinator(SimpleNamespace(state_dir=tmp_path), None, None, None, None, None, seen.append)
+    for status in ("done", "failed", "cancelled", "waiting"):
+        coordinator._notify(TaskEvent("t1", status, None, None))
+    assert [e["kind"] for e in read_events(tmp_path, 0)] == ["task.done", "task.failed"]
+    assert len(seen) == 4

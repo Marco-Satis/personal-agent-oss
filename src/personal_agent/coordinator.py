@@ -45,6 +45,7 @@ from .tasks import (
     result_path,
 )
 from .textsafe import strip_invisible
+from .timeaware import record_event
 from .vault import Vault, VaultError, valid_domain
 
 if TYPE_CHECKING:
@@ -263,6 +264,11 @@ class Coordinator:
         return scope is not None and self.broker.scope_pending(scope)
 
     def _notify(self, event: TaskEvent) -> None:
+        if event.status in ("done", "failed"):
+            try:
+                record_event(self.board.state_dir, f"task.{event.status}")
+            except (OSError, ValueError, AttributeError):
+                pass  # the time note is a hint; the work goes on without it
         try:
             self.notify(event)
         except Exception as exc:  # noqa: BLE001 - a notice must never stop the work

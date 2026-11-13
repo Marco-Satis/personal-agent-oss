@@ -68,6 +68,7 @@ from .approval_server import (
 from .bridge import DELEGATE_TOOL
 from .status import clean_text
 from .textsafe import strip_invisible
+from .timeaware import record_event
 from .vault import TASK_ID_RE, Vault, valid_domain
 
 if TYPE_CHECKING:
@@ -885,6 +886,7 @@ class ApprovalBroker:
         self.bind_wait_s = bind_wait_s
         self.closing = threading.Event()
         self.on_delegate: Callable[[str, str | None], str] | None = None  # TaskService.delegate
+        self.events_dir: Path | None = None  # state dir for timeaware events (helper approvals)
         self._cond = threading.Condition()
         self._queue = _PromptQueue(self._cond)
         self._main = ApprovalScope(
@@ -1370,6 +1372,11 @@ class ApprovalBroker:
             except Exception as exc:  # noqa: BLE001
                 log.warning("approval channel failed: %s", type(exc).__name__)
                 approved = False
+            if helper and self.events_dir is not None:
+                try:  # a helper's approval decided while the chat may be away: worth a line in the time note
+                    record_event(self.events_dir, "approval.resolved", "approved" if approved else "denied")
+                except (OSError, ValueError):
+                    pass
             if self.clock() > deadline:
                 return self._refuse(scope, "approval timed out")
             if self.closing.is_set() or not self._live(scope):

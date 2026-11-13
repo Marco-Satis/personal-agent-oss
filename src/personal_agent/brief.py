@@ -74,6 +74,7 @@ from .router import SafetyStop, guarded_send
 from .statefiles import read_private_json, remove_private, write_private_json
 from .status import STATES, SessionStatus, clean_text, format_status_line, read_statuses
 from .textsafe import strip_invisible
+from .timeaware import record_event
 from .vault import Task, Vault, VaultError
 
 if TYPE_CHECKING:
@@ -931,6 +932,10 @@ def _run_locked(config: "Config", now: datetime, send: bool, polish: bool, by: s
     if all(record["done"] for record in attempt.values()):
         state.update(status="sent", last_brief_at=ts)
         remove_private(config.state_dir, CHUNKS_FILE)  # sent: no resume needed, no copy of the text kept
+        try:
+            record_event(config.state_dir, "brief.sent")
+        except (OSError, ValueError):
+            pass  # the time note is a hint; the brief went out
         code = 0
     else:
         state.update(status="failed", attempts=attempts + 1)

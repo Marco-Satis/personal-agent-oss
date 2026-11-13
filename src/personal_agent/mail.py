@@ -49,6 +49,7 @@ from .mailparse import SIGNAL_CODES, SIGNAL_TEXTS, clean_block, clean_line, disp
     mask_codes, message_ref
 from .mailtriage import PayeeStore, category_counts, classify, find_ibans, health_notes, payee_lines
 from .mailtriage import label as category_label
+from .timeaware import record_event
 from .notify import telegram_untrusted
 from .statefiles import read_private_json, write_private_json
 
@@ -511,6 +512,7 @@ class MailCache:
     def merge_scan(self, response: dict) -> CacheView:
         """Merge a worker `scan` response (validated and cleaned again) into the cache."""
         now = self.clock()
+        arrived: list[str] = []  # categories of messages new since the last scan of a known folder
         with self._locked():
             data = self._read()
             refs = {(name, folder, info["uidvalidity"], r["uid"]): r["ref"]
@@ -552,12 +554,17 @@ class MailCache:
                     raw_records = info.get("records")
                     records = [r for r in (clean_record(x) for x in (raw_records or [])[:MAX_PER_FOLDER]
                                            if isinstance(raw_records, list)) if r]
+                    known = old is not None and old.get("uidvalidity") == uidvalidity
+                    old_next = _count(old.get("uidnext")) if known else None
                     for record in sorted(records, key=lambda r: r["uid"], reverse=True):
                         key = (name, folder, uidvalidity, record["uid"])
                         ref = refs.get(key)
                         if ref is None:
                             ref = message_ref(name, folder, uidvalidity, record["uid"], set(refs.values()))
                             refs[key] = ref
+                            if old_next is not None and record["uid"] >= old_next:
+                                arrived.append(classify(record["subject"], is_list=record["list"],
+                                                        is_auto=record["auto"]))
                         window.append({"ref": ref, **record})
                     account["folders"][folder] = {
                         "uidvalidity": uidvalidity, "uidnext": _count(info.get("uidnext")),
@@ -569,7 +576,13 @@ class MailCache:
             _bound(data)
             data["checked_at"] = now
             self._save(data)
-            return _view(data)
+            view = _view(data)
+        for category in arrived[:MAX_PER_FOLDER]:
+            try:
+                record_event(self.state_dir, "mail.new", category, now=now)
+            except (OSError, ValueError):
+                break  # the time note is a hint; a mail scan never fails over it
+        return view
 
 
 def _bound(data: dict) -> None:

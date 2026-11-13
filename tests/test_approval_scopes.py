@@ -317,6 +317,19 @@ def test_main_idle_helper_prompt_is_approved_on_the_console(broker, monkeypatch)
     assert lines[1] == '  task: "Summarise the backups"'
 
 
+def test_decided_helper_approval_is_recorded_for_the_time_note(broker, tmp_path):
+    from personal_agent.timeaware import read_events
+
+    broker.events_dir = tmp_path / "events"
+    broker.channel = Channel(lambda r, d: True)
+    assert ask(broker, helper(broker), "Edit", append()).allow
+    broker.channel = Channel(lambda r, d: False)
+    note = "- 2026-10-18 (task def456): restic supports append-only repositories"
+    assert not ask(broker, helper(broker, task_id="def456"), "Edit", append(note=note)).allow
+    assert [(e["kind"], e["label"]) for e in read_events(broker.events_dir, 0)] == [
+        ("approval.resolved", "approved"), ("approval.resolved", "denied")]
+
+
 # --- what helpers may write -------------------------------------------------------------
 
 

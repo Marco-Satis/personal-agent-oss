@@ -423,6 +423,8 @@ def test_run_brief_state_transitions(tmp_path):
     state, corrupt = load_state(config)
     assert not corrupt and state["status"] == "sent" and state["sent_by"] == "manual"
     assert state["date"] == "2026-10-18" and state["last_brief_at"] == TS and state["attempts"] == 0
+    from personal_agent.timeaware import read_events
+    assert [e["kind"] for e in read_events(config.state_dir, 0)] == ["brief.sent"]  # for the time note
     assert stat.S_IMODE((config.state_dir / "brief.json").stat().st_mode) == 0o600
     assert "Open tasks: 2 open" in opener.texts[0]  # counts mode by default
     assert "call the bank" not in opener.texts[0]

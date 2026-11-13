@@ -145,6 +145,7 @@ source checkout the core plugin was found in (the default `$PA_STATE_DIR/vault` 
 | `PA_QUOTA_STOP` | `0.9` | stop sending at this share of a usage window (greater than 0, at most 1) |
 | `PA_ROUTER_SMALL_MODEL` | `haiku` | model alias for tier 2; `off` sends everything to the main assistant |
 | `PA_ROUTER_SMALL_MAX_CHARS` | `160` | longest message tier 2 may take (20–2000) |
+| `PA_TIME_NOTE` | `on` | put a time note in front of every tier-2/3 message (see [Time note](#time-note)) |
 | `PA_TASKS` | `on` | background tasks in the chat (`on`/`off`) |
 | `PA_TASK_PARALLEL` | `2` | helpers running at once (1–2) |
 | `PA_TASK_MODEL` | the chat's model | model alias for helpers |
@@ -155,6 +156,22 @@ source checkout the core plugin was found in (the default `$PA_STATE_DIR/vault` 
 | `PA_TASK_DELEGATION` | `off` | `on`: the main assistant may queue tasks itself, each with your approval |
 | `PA_DOMAIN_CONTEXT_CHARS` | `4000` | character budget for domain notes attached to a helper's message (0–8000, `0` attaches none) |
 | `PA_SESSIONS_SOURCE` | `hooks` | where `sessions` looks: `hooks` (status files), `agents` (`claude agents --json`) or `both`; see [below](#connect-your-claude-code-sessions) |
+
+### Time note
+
+The model does not know what time it is or how long you were away. The router therefore puts
+one line in front of every tier-2 and tier-3 message:
+
+```
+[time: Fri 2026-11-13 19:20 · 1 h 7 min since the last message (18:13) · since then: 3 new mails (2 request, 1 payment), 1 background task done]
+```
+
+The gap is kept per channel (console, Telegram) in `$PA_STATE_DIR/last_seen.json`. The events
+come from `$PA_STATE_DIR/events.jsonl`: new mail per category (only mail that arrived after the
+previous scan of a folder), helper approvals you decided, finished or failed background tasks and
+sent briefs. The log holds kinds and fixed category words only, never subjects, senders or
+other text, because it is read back into the model's context. It is capped at 256 KB.
+`PA_TIME_NOTE=off` turns the note off.
 
 ### Background tasks
 
