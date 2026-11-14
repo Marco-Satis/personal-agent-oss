@@ -583,6 +583,41 @@ def _cmd_safety(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_backup(config: Config, args: argparse.Namespace) -> int:
+    """Pack, list or check backups of the state directory and the vault (never restores)."""
+    from .backup import BackupError, backup_dir, create_backup, list_backups, verify_backup
+
+    target = backup_dir(config.state_dir, args.dir)
+    if args.backup_command == "create":
+        try:
+            result = create_backup(config.state_dir, config.vault_path, claude_config_dir=config.bridge_paths()[1],
+                                   dest=args.dir, keep=args.keep)
+        except (BackupError, OSError) as exc:
+            print(f"backup failed: {exc}", file=sys.stderr)
+            return 1
+        check = verify_backup(result.path)
+        print(f"backup: {result.path} ({result.files} files, {result.size // 1024} KB)"
+              + (f"; removed {len(result.removed)} older" if result.removed else ""))
+        print("check: ok" if check.ok else "check FAILED: " + "; ".join(check.problems))
+        print("note: the Claude Code login is not in the backup; copy the archive off this machine")
+        return 0 if check.ok else 1
+    archives = list_backups(target)
+    if args.backup_command == "list":
+        if not archives:
+            print(f"no backups in {target}")
+        for path in archives:
+            print(f"{path.name}  {path.stat().st_size // 1024} KB")
+        return 0
+    path = Path(args.path) if args.path else (archives[-1] if archives else None)
+    if path is None:
+        print(f"no backups in {target}", file=sys.stderr)
+        return 1
+    check = verify_backup(path)
+    print(f"{path.name}: {check.files} files in {', '.join(check.roots) or '-'}; "
+          + ("ok" if check.ok else "FAILED: " + "; ".join(check.problems)))
+    return 0 if check.ok else 1
+
+
 def _cmd_mail(config: Config, args: argparse.Namespace) -> int:
     """Check the mail setup: names, folders and switches, never a user, address, URL or password."""
     from .mail import WorkerClient, WorkerError
@@ -710,6 +745,15 @@ def build_parser() -> argparse.ArgumentParser:
     safety_sub.add_parser("status", help="show the safety stop")
     safety_sub.add_parser("clear", help="clear the safety stop (terminal only)")
 
+    backup = sub.add_parser("backup", help="back up the state directory and the vault (never restores)")
+    backup.add_argument("--dir", type=Path, default=None, help="backup folder (default: <state dir>/backups)")
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    create = backup_sub.add_parser("create", help="pack a new archive, check it, keep the newest N")
+    create.add_argument("--keep", type=int, default=7, help="archives to keep (1-90, default 7)")
+    backup_sub.add_parser("list", help="list the archives")
+    verify = backup_sub.add_parser("verify", help="read every file of an archive (default: the newest)")
+    verify.add_argument("path", nargs="?", help="archive to check")
+
     mail = sub.add_parser("mail", help="the read-only mail reader (PA_MAIL_CONFIG)")
     mail_sub = mail.add_subparsers(dest="mail_command", required=True)
     mail_check = mail_sub.add_parser("check", help="check the mail config (names only; --connect logs in)")
@@ -732,6 +776,7 @@ COMMANDS = {
     "safety": _cmd_safety,
     "modules": _cmd_modules,
     "mail": _cmd_mail,
+    "backup": _cmd_backup,
 }
 
 

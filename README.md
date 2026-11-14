@@ -601,6 +601,20 @@ export PA_STT_COMMAND="$HOME/.local/share/personal-agent/stt-venv/bin/python -I 
 The model is downloaded on first use (about 500 MB for `small`) and read from disk afterwards. On a
 12-core VPS, `small` needs about 3 seconds for an 11-second message.
 
+### Backups
+
+```bash
+personal-agent backup create            # pack state + vault, check the archive, keep the newest 7
+personal-agent backup list
+personal-agent backup verify [ARCHIVE]  # read every file of an archive (default: the newest)
+```
+
+Archives go to `$PA_STATE_DIR/backups` (or `--dir`), 0600 in a 0700 folder. They hold the state
+directory and the vault, but not the Claude Code login (`claude-config`), runtime files (`run/`,
+locks, sockets) or symlinks; after a restore, run `claude setup-token` again. The archives contain
+private data, and a copy on the same disk does not survive the disk: copy them off the machine.
+Restoring is manual for now (`tar -xzf` into an empty folder, then point `PA_STATE_DIR` at it).
+
 ## Connect your Claude Code sessions
 
 Your sessions report their state through a small hook (standard library only) that writes one status
