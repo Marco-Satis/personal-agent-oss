@@ -143,7 +143,7 @@ def test_init_reports_the_real_model_and_cli_version(tmp_path, fake_bin, caplog)
     finally:
         session.close()
     assert (session.resolved_model, session.cli_version) == ("claude-sonnet-5-5", "2.1.302")
-    assert "claude runs model claude-sonnet-5-5 (asked for sonnet), CLI 2.1.302" in caplog.text
+    assert "claude runs model claude-sonnet-5-5 (asked for claude-sonnet-5-5), CLI 2.1.302" in caplog.text
 
 
 def test_init_values_that_do_not_look_like_ids_are_dropped(tmp_path, fake_bin):
@@ -316,3 +316,15 @@ def test_tier2_session_gets_the_hardened_settings(tmp_path):
 
     args = build_args(BridgeConfig(workdir=tmp_path, config_dir=tmp_path, tools=(), model="haiku"))
     assert args[args.index("--settings") + 1] == HARDENED_SETTINGS
+
+
+def test_default_model_is_a_pinned_id_not_an_alias(monkeypatch, tmp_path):
+    from personal_agent.config import DEFAULT_CLAUDE_MODEL, Config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PA_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("PA_CLAUDE_MODEL", raising=False)
+    assert DEFAULT_CLAUDE_MODEL == "claude-sonnet-5-5"  # Marco 14.11.2026; checked against the models overview
+    assert Config.from_env().claude_model == DEFAULT_CLAUDE_MODEL == BridgeConfig.model
+    monkeypatch.setenv("PA_CLAUDE_MODEL", "sonnet")
+    assert Config.from_env().claude_model == "sonnet"  # an alias is still possible on purpose

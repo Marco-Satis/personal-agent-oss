@@ -227,6 +227,10 @@ def _default_state_dir() -> Path:
     return Path(base) / "personal-agent"
 
 
+# Pinned model id (Marco 14.11.2026, B7): an alias like "sonnet" silently moves to the next release.
+# Checked against the Claude models overview on 14.11.2026. PA_CLAUDE_MODEL still accepts an alias.
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+
 @dataclass(frozen=True)
 class TwilioConfig:
     account_sid: str
@@ -253,7 +257,7 @@ class Config:
     status_max_age_min: int = 24 * 60
     twilio: TwilioConfig | None = field(default=None, repr=False)
     claude_bin: str = "claude"
-    claude_model: str = "sonnet"
+    claude_model: str = DEFAULT_CLAUDE_MODEL
     vault_dir: Path | None = None
     vault_context_chars: int = 3000
     core_plugin: Path | None = None  # PA_CORE_PLUGIN_DIR; None means auto-discovery
@@ -505,7 +509,7 @@ class Config:
             status_max_age_min=_env_int("PA_STATUS_MAX_AGE_MIN", 24 * 60),
             twilio=twilio,
             claude_bin=_env("PA_CLAUDE_BIN", "claude") or "claude",
-            claude_model=_env("PA_CLAUDE_MODEL", "sonnet") or "sonnet",
+            claude_model=_env("PA_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL) or DEFAULT_CLAUDE_MODEL,
             vault_dir=vault_dir or legacy_workdir,
             vault_context_chars=vault_context_chars,
             core_plugin=core_plugin,

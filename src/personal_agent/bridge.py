@@ -98,7 +98,7 @@ class BridgeConfig:
     workdir: Path
     config_dir: Path
     claude_bin: str = "claude"
-    model: str = "sonnet"
+    model: str = "claude-sonnet-5-5"  # same pin as config.DEFAULT_CLAUDE_MODEL
     tools: tuple[str, ...] = ("Read", "Glob", "Grep")
     mcp_config: Path | None = None
     permission_tool: str | None = None

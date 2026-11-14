@@ -135,7 +135,7 @@ source checkout the core plugin was found in (the default `$PA_STATE_DIR/vault` 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PA_CLAUDE_MODEL` | `sonnet` | model alias |
+| `PA_CLAUDE_MODEL` | `claude-sonnet-5-5` | model id; pinned so an update never changes the model silently (an alias like `sonnet` still works). The log shows the model the CLI actually runs |
 | `PA_VAULT_DIR` | `$PA_STATE_DIR/vault` | the vault, the only folder the assistant's file tools can touch; `PA_WORKDIR` is still accepted as an alias |
 | `PA_VAULT_CONTEXT_CHARS` | `3000` | character budget for note excerpts attached to tier-3 messages (0–12000, `0` turns them off) |
 | `PA_CORE_PLUGIN_DIR` | `plugins/core` of a source checkout | the shipped core plugin; `off` disables it |
