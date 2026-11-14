@@ -65,6 +65,7 @@ from .approval_server import (
     TOOL_NAME,
     input_digest,
 )
+from .audit import record_approval
 from .bridge import DELEGATE_TOOL
 from .status import clean_text
 from .textsafe import strip_invisible
@@ -887,6 +888,7 @@ class ApprovalBroker:
         self.closing = threading.Event()
         self.on_delegate: Callable[[str, str | None], str] | None = None  # TaskService.delegate
         self.events_dir: Path | None = None  # state dir for timeaware events (helper approvals)
+        self.audit_dir: Path | None = None  # state dir for the audit log (audit.py)
         self._cond = threading.Condition()
         self._queue = _PromptQueue(self._cond)
         self._main = ApprovalScope(
@@ -1176,6 +1178,13 @@ class ApprovalBroker:
             int(level) if level is not None else "-",
             "allow" if verdict.allow else "deny",
         )
+        if self.audit_dir is not None and (level is None or level >= Level.WRITE):
+            try:
+                record_approval(self.audit_dir, scope=scope.name, channel=self._main.label, tool=tool_name,
+                                level=int(level) if level is not None else None, allow=verdict.allow,
+                                reason=verdict.message)
+            except (OSError, ValueError) as exc:
+                log.warning("audit log write failed: %s", type(exc).__name__)
         return verdict
 
     def _match(self, scope: ApprovalScope, tool_name: str, tool_input: dict, tool_use_id: str | None,

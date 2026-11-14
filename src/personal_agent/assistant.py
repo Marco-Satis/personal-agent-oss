@@ -218,6 +218,7 @@ def prepare_assistant(config: Config, *, label: str, channel: Callable[["Approva
     broker.allowed_skills = frozenset(allowed_skills)
     broker.channel = channel(broker)
     broker.events_dir = config.state_dir if config.time_note else None
+    broker.audit_dir = config.state_dir
     runtime_parent: Path | None = config.state_dir / "run"
     if _inside(runtime_parent.resolve(), root):
         runtime_parent = None

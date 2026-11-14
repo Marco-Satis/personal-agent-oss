@@ -583,6 +583,18 @@ def _cmd_safety(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_audit(config: Config, args: argparse.Namespace) -> int:
+    """Show the newest approval decisions (tool, level, decision, never the input)."""
+    from .audit import format_entry, read_audit
+
+    entries = read_audit(config.state_dir, max(1, min(args.last, 1000)))
+    if not entries:
+        print("no approvals recorded yet")
+    for entry in entries:
+        print(format_entry(entry))
+    return 0
+
+
 def _cmd_backup(config: Config, args: argparse.Namespace) -> int:
     """Pack, list or check backups of the state directory and the vault (never restores)."""
     from .backup import BackupError, backup_dir, create_backup, list_backups, verify_backup
@@ -745,6 +757,9 @@ def build_parser() -> argparse.ArgumentParser:
     safety_sub.add_parser("status", help="show the safety stop")
     safety_sub.add_parser("clear", help="clear the safety stop (terminal only)")
 
+    audit = sub.add_parser("audit", help="the newest approval decisions (never the tool input)")
+    audit.add_argument("--last", type=int, default=20, help="how many lines (1-1000, default 20)")
+
     backup = sub.add_parser("backup", help="back up the state directory and the vault (never restores)")
     backup.add_argument("--dir", type=Path, default=None, help="backup folder (default: <state dir>/backups)")
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
@@ -777,6 +792,7 @@ COMMANDS = {
     "modules": _cmd_modules,
     "mail": _cmd_mail,
     "backup": _cmd_backup,
+    "audit": _cmd_audit,
 }
 
 

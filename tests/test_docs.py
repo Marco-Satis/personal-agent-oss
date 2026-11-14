@@ -39,7 +39,7 @@ def test_cli_has_no_command_that_sends_to_a_session():
     commands = _subcommands(build_parser())
     assert set(commands) == set(COMMANDS) == {
         "serve", "escalate", "status", "simulate", "chat", "vault", "plugins", "brief", "hooks", "telegram", "safety",
-        "modules", "mail", "backup"}
+        "modules", "mail", "backup", "audit"}
     assert set(_subcommands(commands["telegram"])) == {"pair", "status", "unpair"}
     assert set(_subcommands(commands["backup"])) == {"create", "list", "verify"}  # no restore over live data
     assert set(_subcommands(commands["hooks"])) == {"snippet"}

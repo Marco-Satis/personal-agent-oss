@@ -1,4 +1,5 @@
 import json
+import json
 import stat
 import threading
 import time
@@ -315,6 +316,19 @@ def test_main_idle_helper_prompt_is_approved_on_the_console(broker, monkeypatch)
     assert ask(broker, scope, "Edit", append()).allow
     assert lines[0] == f"[approval · task {TASK} (research)] level 2 (write): Edit"
     assert lines[1] == '  task: "Summarise the backups"'
+
+
+def test_write_approvals_are_audited_but_reads_are_not(broker, tmp_path):
+    from personal_agent.audit import read_audit
+
+    broker.audit_dir = tmp_path / "audit"
+    broker.channel = Channel(lambda r, d: True)
+    scope = helper(broker)
+    assert ask(broker, scope, "Read", {"file_path": DOMAIN_FILE}).allow
+    assert ask(broker, scope, "Edit", append()).allow
+    entries = read_audit(broker.audit_dir)
+    assert [(e["scope"], e["tool"], e["level"], e["decision"]) for e in entries] == [(scope.name, "Edit", 2, "allow")]
+    assert "restic" not in json.dumps(entries)  # the tool input never reaches the log
 
 
 def test_decided_helper_approval_is_recorded_for_the_time_note(broker, tmp_path):

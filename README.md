@@ -601,6 +601,13 @@ export PA_STT_COMMAND="$HOME/.local/share/personal-agent/stt-venv/bin/python -I 
 The model is downloaded on first use (about 500 MB for `small`) and read from disk afterwards. On a
 12-core VPS, `small` needs about 3 seconds for an 11-second message.
 
+### Audit log
+
+Every approval of level 2 (write) or 3 (danger), and every approval that failed, is written to
+`$PA_STATE_DIR/audit.jsonl`: time, session (`main` or a helper task), the channel you answered on,
+tool name, level, allow/deny and the reason. The tool input (paths, text, mail content) is never
+logged. The file is 0600 and capped at 1 MB. `personal-agent audit [--last N]` shows the newest lines.
+
 ### Backups
 
 ```bash
