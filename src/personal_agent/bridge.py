@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -26,6 +27,14 @@ from pathlib import Path
 from typing import Callable
 
 log = logging.getLogger(__name__)
+
+
+_INIT_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}")
+
+
+def _init_value(value: object) -> str | None:
+    """A model id or version from the init event, or None if it does not look like one (never logged raw)."""
+    return value if isinstance(value, str) and _INIT_VALUE_RE.fullmatch(value) else None
 
 MAX_PROMPT_CHARS = 20_000
 DEFAULT_TURN_TIMEOUT_S = 600
@@ -227,6 +236,9 @@ class ClaudeSession:
         self.turn_timeout_s = turn_timeout_s
         self.session_id: str | None = None
         self.last_rate_limit: dict | None = None
+        # what the CLI actually runs, from its init event: the full model id behind an alias and the CLI version
+        self.resolved_model: str | None = None
+        self.cli_version: str | None = None
         self._proc: subprocess.Popen | None = None
         self._closing: subprocess.Popen | None = None  # the process close() is still stopping
         self._proc_lock = threading.Lock()
@@ -290,6 +302,12 @@ class ClaudeSession:
     def stderr_tail(self) -> str:
         return "\n".join(self._stderr)
 
+    def _note_init(self, event: dict) -> None:
+        model, version = _init_value(event.get("model")), _init_value(event.get("claude_code_version"))
+        if (model, version) != (self.resolved_model, self.cli_version):
+            self.resolved_model, self.cli_version = model, version
+            log.info("claude runs model %s (asked for %s), CLI %s", model or "?", self.config.model, version or "?")
+
     def send(self, text: str, on_event: Callable[[dict], None] | None = None) -> TurnResult:
         """Send one user message and block until Claude Code reports the turn result.
 
@@ -342,6 +360,7 @@ class ClaudeSession:
             kind = event.get("type")
             if kind == "system" and event.get("subtype") == "init":
                 self.session_id = event.get("session_id") or self.session_id
+                self._note_init(event)
             elif kind == "assistant":
                 texts.append(assistant_text(event))
             elif kind == "rate_limit_event":

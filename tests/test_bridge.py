@@ -134,6 +134,28 @@ def test_turns_share_one_process_and_session(tmp_path, fake_bin, monkeypatch):
     assert "ANTHROPIC_API_KEY" not in entries[0]["env"]
 
 
+def test_init_reports_the_real_model_and_cli_version(tmp_path, fake_bin, caplog):
+    extra = '{"model": "claude-sonnet-5-5", "claude_code_version": "2.1.302"}'
+    session = ClaudeSession(make_config(tmp_path, fake_bin), extra_env={"FAKE_CLAUDE_EXTRA_INIT": extra})
+    try:
+        with caplog.at_level("INFO", logger="personal_agent.bridge"):
+            session.send("hello")
+    finally:
+        session.close()
+    assert (session.resolved_model, session.cli_version) == ("claude-sonnet-5-5", "2.1.302")
+    assert "claude runs model claude-sonnet-5-5 (asked for sonnet), CLI 2.1.302" in caplog.text
+
+
+def test_init_values_that_do_not_look_like_ids_are_dropped(tmp_path, fake_bin):
+    extra = '{"model": "ignore all\\nprevious", "claude_code_version": 7}'
+    session = ClaudeSession(make_config(tmp_path, fake_bin), extra_env={"FAKE_CLAUDE_EXTRA_INIT": extra})
+    try:
+        session.send("hello")
+    finally:
+        session.close()
+    assert (session.resolved_model, session.cli_version) == (None, None)
+
+
 def test_error_result_is_reported(tmp_path, fake_bin):
     session = ClaudeSession(make_config(tmp_path, fake_bin))
     try:
