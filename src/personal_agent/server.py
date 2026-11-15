@@ -146,6 +146,9 @@ class Agent:
         return result
 
     def _decide_and_call(self, event: Event) -> dict:
+        if not self.config.escalation_enabled:
+            log.info("event %s (%s): call=False, phone escalation is off", event.key, event.severity)
+            return {"called": False, "reason": "phone escalation is off"}
         decision = self.policy.decide(event)
         log.info("event %s (%s): call=%s, %s", event.key, event.severity, decision.call, decision.reason)
         if not decision.call:
@@ -534,6 +537,10 @@ def start_rhythm_thread(config: Config, stop: threading.Event,
 
 def serve(config: Config) -> None:
     config.validate_for_serve()
+    if not config.escalation_enabled:
+        log.info("phone escalation is off (PA_CALL_TO and PA_CALL_PIN not set); alerts still go to the notice channels")
+    if not config.api_token:
+        log.info("PA_API_TOKEN not set: /escalate and /internal/ refuse every request")
     config.state_dir.mkdir(parents=True, exist_ok=True)
     Path(config.status_dir).mkdir(parents=True, exist_ok=True)
     if config.bind_host not in ("127.0.0.1", "::1", "localhost"):

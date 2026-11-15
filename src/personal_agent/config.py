@@ -364,6 +364,11 @@ class Config:
         return bool(self.discord_webhook and self.public_approval_url) or bool(self.telegram_token)
 
     @property
+    def escalation_enabled(self) -> bool:
+        """Phone escalation runs only with a number and a PIN (both optional since 15.11.2026)."""
+        return bool(self.call_to and self.call_pin)
+
+    @property
     def vault_path(self) -> Path:
         """The vault: the assistant's Markdown workspace (PA_VAULT_DIR or state_dir/vault)."""
         return self.vault_dir or self.state_dir / "vault"
@@ -612,11 +617,16 @@ class Config:
 
     def validate_for_serve(self) -> None:
         """Checks that only matter when the HTTP server runs."""
-        if not self.api_token or len(self.api_token) < 24:
-            raise ConfigError("PA_API_TOKEN must be set and at least 24 characters long")
-        if not self.call_to:
-            raise ConfigError("PA_CALL_TO must be set (the number to call, E.164)")
-        validate_pin(self.call_pin)
+        # Phone escalation is optional (Marco 15.11.2026, MB195 B): without PA_CALL_TO and PA_CALL_PIN
+        # serve still starts, alerts still go to the notice channels, nobody is called.
+        if self.api_token is not None and len(self.api_token) < 24:
+            raise ConfigError("PA_API_TOKEN must be at least 24 characters long")
+        if bool(self.call_to) != bool(self.call_pin):
+            raise ConfigError("PA_CALL_TO and PA_CALL_PIN go together: set both for phone escalation, or neither")
+        if self.call_pin:
+            validate_pin(self.call_pin)
+        if self.provider == "twilio" and not self.escalation_enabled:
+            raise ConfigError("PA_PROVIDER=twilio needs PA_CALL_TO and PA_CALL_PIN")
         if self.provider == "twilio" and not (self.public_url or "").startswith("https://"):
             raise ConfigError("PA_PUBLIC_URL must be an https:// URL when using Twilio")
         if self.public_approval_url and not (self.discord_webhook or self.telegram_token):

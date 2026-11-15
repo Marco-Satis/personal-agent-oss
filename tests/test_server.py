@@ -167,6 +167,56 @@ def test_validate_for_serve_brief_rules(tmp_path):
     Config(**{**base.__dict__, "brief_time": (7, 30), "discord_webhook": HOOK}).validate_for_serve()
 
 
+def test_serve_starts_without_phone_escalation_and_rejects_half_configs(tmp_path):
+    bare = Config(state_dir=tmp_path / "state", status_dir=tmp_path / "sessions", port=0)
+    bare.validate_for_serve()  # MB195 B (15.11.2026): no token, number or PIN needed to start
+    assert not bare.escalation_enabled and config(tmp_path).escalation_enabled
+    for overrides, message in (({"call_to": "+447700900123"}, "go together"),
+                               ({"call_pin": PIN}, "go together"),
+                               ({"call_to": "+447700900123", "call_pin": "12"}, "at least 6 digits"),
+                               ({"api_token": "short"}, "at least 24"),
+                               ({"provider": "twilio", "public_url": PUBLIC}, "twilio needs PA_CALL_TO")):
+        with pytest.raises(ConfigError, match=message):
+            Config(**{**bare.__dict__, **overrides}).validate_for_serve()
+
+
+class Notices:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, kind, build, key=None, exclude=()):
+        self.sent.append((kind, key))
+
+    def telegram_ready(self):
+        return False
+
+
+def test_without_phone_escalation_nobody_is_called_but_the_alert_still_goes_out(tmp_path, caplog):
+    caplog.set_level("INFO")
+    fake, notices = FakeProvider(), Notices()
+    bare = Config(state_dir=tmp_path / "state", status_dir=tmp_path / "sessions", port=0, min_call_interval_min=0)
+    agent = Agent(bare, provider=fake, notifier=notices)
+    from personal_agent.escalation import Event
+
+    result = agent.escalate(Event(key="disk", severity="critical", summary="Disk full", source="test"))
+    assert result == {"called": False, "reason": "phone escalation is off"}
+    assert fake.placed == [] and notices.sent == [("alert", "disk")]
+    assert "phone escalation is off" in caplog.text and "+44" not in caplog.text
+
+
+def test_escalate_endpoint_refuses_without_api_token(tmp_path):
+    bare = Config(state_dir=tmp_path / "state", status_dir=tmp_path / "sessions", port=0)
+    server = make_server(Agent(bare, provider=FakeProvider()))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        assert escalate(base, {"key": "a", "severity": "critical"}, token="")[0] == 401
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_brief_loop_survives_errors_and_stops():
     from personal_agent.server import _brief_loop
 

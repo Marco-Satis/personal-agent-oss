@@ -49,6 +49,11 @@ set -a; . ./.env; set +a
 personal-agent serve    # listens on 127.0.0.1:8787, provider "fake" places no real call
 ```
 
+Phone escalation is optional. With `PA_CALL_TO` and `PA_CALL_PIN` (both, at least 6 digits) an event
+can place a call; without them `serve` still starts, logs once that escalation is off, and alerts only
+go to the notice channels (`PA_NOTIFY_ALERT`). `PA_API_TOKEN` (at least 24 characters) unlocks
+`/escalate` and `/internal/`; without it both refuse every request.
+
 Raise an event from anywhere on the same machine:
 
 ```bash
