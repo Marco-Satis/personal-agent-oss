@@ -25,6 +25,7 @@ one-time page stays available as a review link when PA_PUBLIC_APPROVAL_URL is se
 
 from __future__ import annotations
 
+import collections
 import hmac
 import html
 import json
@@ -34,6 +35,7 @@ import secrets
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -168,14 +170,38 @@ class DiscordWebhook:
         return True
 
 
-class NtfyClient:
-    """Posts plain text to one ntfy topic. URL and token are secrets and never logged."""
+NTFY_OWN_TAG = "pa-agent"  # every message the agent sends carries it; the inbox skips them (no loops)
 
-    def __init__(self, url: str, token: str | None = None, timeout_s: int = 10, opener: Callable | None = None) -> None:
+
+class OwnMessages:
+    """Ids of the ntfy messages this process sent (bounded). Second guard next to the tag."""
+
+    def __init__(self, size: int = 500) -> None:
+        self._ids: collections.deque[str] = collections.deque(maxlen=size)
+        self._lock = threading.Lock()
+
+    def add(self, message_id: str) -> None:
+        with self._lock:
+            self._ids.append(message_id)
+
+    def __contains__(self, message_id: object) -> bool:
+        with self._lock:
+            return message_id in self._ids
+
+
+class NtfyClient:
+    """Posts plain text to one ntfy topic. URL and token are secrets and never logged.
+
+    Every post carries the tag NTFY_OWN_TAG and, with `own`, its id is remembered, so the
+    inbox (ntfy_inbox.py) never treats the agent's own messages as input."""
+
+    def __init__(self, url: str, token: str | None = None, timeout_s: int = 10, opener: Callable | None = None,
+                 own: OwnMessages | None = None) -> None:
         self._url = url
         self._token = token
         self.timeout_s = timeout_s
         self._opener = opener or urllib.request.build_opener(_NoRedirect()).open
+        self.own = own
 
     def __repr__(self) -> str:
         return "NtfyClient(<hidden>)"
@@ -186,6 +212,7 @@ class NtfyClient:
             request.add_header("Content-Type", "text/plain; charset=utf-8")
             request.add_header("User-Agent", f"personal-agent/{__version__}")
             request.add_header("Markdown", "no")
+            request.add_header("Tags", NTFY_OWN_TAG)
             if title:
                 request.add_header("Title", title.encode("ascii", "replace").decode()[:80])
             if priority is not None:
@@ -194,6 +221,7 @@ class NtfyClient:
                 request.add_header("Authorization", f"Bearer {self._token}")
             with self._opener(request, timeout=self.timeout_s) as response:
                 code = getattr(response, "status", None) or response.getcode()
+                body = response.read(4096)
         except urllib.error.HTTPError as exc:
             _close_quietly(exc)
             log.warning("ntfy post failed: HTTPError %s", exc.code)
@@ -204,7 +232,35 @@ class NtfyClient:
         if not 200 <= int(code) < 300:
             log.warning("ntfy post failed: HTTP %s", code)
             return False
+        if self.own is not None:
+            try:
+                message_id = json.loads(body).get("id")
+            except (ValueError, AttributeError):
+                message_id = None
+            if isinstance(message_id, str):
+                self.own.add(message_id)
         return True
+
+    def poll(self, since: str) -> list[dict]:
+        """Messages after `since` (a message id or a unix time), oldest first. Raises OSError/ValueError."""
+        url = f"{self._url}/json?poll=1&since={urllib.parse.quote(since, safe='')}"
+        request = urllib.request.Request(url, method="GET")
+        request.add_header("User-Agent", f"personal-agent/{__version__}")
+        if self._token:
+            request.add_header("Authorization", f"Bearer {self._token}")
+        try:
+            with self._opener(request, timeout=self.timeout_s) as response:
+                raw = response.read(512 * 1024)
+        except urllib.error.HTTPError as exc:
+            _close_quietly(exc)
+            raise OSError(f"ntfy poll failed: HTTP {exc.code}") from None
+        out = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if line.strip():
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    out.append(item)
+        return out
 
 
 # --- the inbox in the server process -------------------------------------------

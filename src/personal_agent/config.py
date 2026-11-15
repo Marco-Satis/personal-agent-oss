@@ -338,6 +338,7 @@ class Config:
     telegram_token: str | None = field(default=None, repr=False)  # PA_TELEGRAM_TOKEN (secret)
     ntfy_url: str | None = field(default=None, repr=False)  # PA_NTFY_URL (full topic URL, secret)
     ntfy_token: str | None = field(default=None, repr=False)  # PA_NTFY_TOKEN (secret, optional)
+    ntfy_inbound: bool = False  # PA_NTFY_INBOUND: read the owner's messages from the same topic (default off)
     # PA_NOTIFY_<KIND>, only the kinds set explicitly, e.g. (("alert", ("discord",)),)
     notify_routes: tuple[tuple[str, tuple[str, ...]], ...] = ()
     brief_telegram: str = "full"       # PA_BRIEF_TELEGRAM: what the brief shows on Telegram
@@ -486,6 +487,9 @@ class Config:
         ntfy_token = _parse_ntfy_token(_env("PA_NTFY_TOKEN"))
         if ntfy_token and not ntfy_url:
             raise ConfigError("PA_NTFY_TOKEN is set but PA_NTFY_URL is not")
+        ntfy_inbound = _env_bool("PA_NTFY_INBOUND", False)
+        if ntfy_inbound and not (ntfy_url and ntfy_token):
+            raise ConfigError("PA_NTFY_INBOUND needs PA_NTFY_URL and PA_NTFY_TOKEN (a topic only you can write to)")
         _validate_routes(notify_routes, telegram_token, discord_webhook, public_approval_url, ntfy_url)
         brief_telegram = (_env("PA_BRIEF_TELEGRAM", "full") or "full").lower()
         if brief_telegram not in BRIEF_TELEGRAM_MODES:
@@ -574,6 +578,7 @@ class Config:
             discord_webhook=discord_webhook,
             ntfy_url=ntfy_url,
             ntfy_token=ntfy_token,
+            ntfy_inbound=ntfy_inbound,
             public_approval_url=public_approval_url,
             approval_pin=approval_pin,
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),

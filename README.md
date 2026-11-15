@@ -474,6 +474,14 @@ ntfy is opt-in per kind: `PA_NOTIFY_BRIEF=ntfy`, `PA_NOTIFY_ALERT=ntfy`, `PA_NOT
 approval buttons, use Telegram or the approval page. Messages are plain text (no markdown, links
 defanged), split at 3800 bytes, at most three per notice. The brief on ntfy follows `PA_BRIEF_TELEGRAM`.
 
+**Talking back (`PA_NTFY_INBOUND=on`, default off).** `serve` then reads the same topic: every message
+that is not the agent's own is handled like a message from you over Telegram (tier-1 commands, notes,
+questions; `/new` starts a new conversation). The agent's own posts carry the tag `pa-agent` and their
+ids are remembered, so it never answers itself. Approvals never happen over ntfy: a level-2/3 request
+is denied with a hint to use the chat or the approval page. PIN-like text and messages older than
+10 minutes are not handled. It needs `PA_NTFY_TOKEN`, and the topic must be writable only by the
+agent's user and yours (`deny-all` otherwise): whoever can write to it is treated as you.
+
 ### Telegram
 
 A Telegram bot brings the agent to your phone: notices, approvals with buttons, and a chat with the same

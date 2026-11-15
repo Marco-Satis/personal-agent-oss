@@ -572,6 +572,9 @@ def serve(config: Config) -> None:
     if telegram is not None:
         telegram.start(agent.approvals)
         log.info("telegram enabled: the assistant polls once the bot is paired (personal-agent telegram pair)")
+    from .ntfy_inbox import start_ntfy_inbox
+
+    ntfy_inbox = start_ntfy_inbox(config)
 
     def on_sigterm(_signum: int, _frame: object) -> None:
         # serve_forever runs in this (main) thread: shutdown() must come from another one.
@@ -589,6 +592,8 @@ def serve(config: Config) -> None:
         stop.set()
         if telegram is not None:
             telegram.close(join_s=8.0)
+        if ntfy_inbox is not None:
+            ntfy_inbox.close(join_s=5.0)
         notifier.close(5.0)
         server.server_close()
         if previous is not None:

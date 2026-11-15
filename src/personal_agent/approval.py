@@ -97,7 +97,7 @@ MAX_TOOL_USES = 64         # announced tool calls remembered per turn
 MAX_SOCKET_PATH = 100      # AF_UNIX allows 108 bytes
 POLL_S = 0.5
 CLOSE_JOIN_S = 3.0         # close() waits this long for running decisions to clean up
-MAIN_LABELS = ("chat", "telegram")  # the main scope's trusted label: the terminal chat or serve's Telegram assistant
+MAIN_LABELS = ("chat", "telegram", "ntfy")  # the main scope's trusted label: terminal chat, serve's Telegram or ntfy assistant
 YES = ("y", "yes", "j", "ja")
 SKILL_TOOL = "Skill"
 SKILL_CONTEXT = "plugin skill in this turn"
@@ -879,7 +879,7 @@ class ApprovalBroker:
         main_label: str = "chat",
     ) -> None:
         if main_label not in MAIN_LABELS:
-            raise ValueError("main_label must be 'chat' or 'telegram'")
+            raise ValueError("main_label must be 'chat', 'telegram' or 'ntfy'")
         self.workdir = Path(workdir)
         self.timeout_s = timeout_s
         self.channel = channel  # replaceable at runtime

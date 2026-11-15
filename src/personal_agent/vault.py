@@ -58,7 +58,7 @@ MAX_TASK_CHARS = 160
 CAPTURE_WINDOW_S = 7 * 24 * 3600
 # Notes captured over Telegram carry this marker: the text came through a third party and
 # may come from a compromised account, so render_context flags excerpts that contain it.
-SOURCE_MARKERS = {"telegram": "[via telegram]"}
+SOURCE_MARKERS = {"telegram": "[via telegram]", "ntfy": "[via ntfy]"}
 RECENCY_DAYS = 30
 EXCERPT_OVERHEAD = 40  # per-excerpt cost of the wrapper tag, counted against the budget
 FILENAME_BONUS = 2.0

@@ -487,8 +487,9 @@ class Notifier:
             targets["discord"] = DiscordTarget(DiscordWebhook(config.discord_webhook))
         if config.ntfy_url:
             from .remote import NtfyClient
+            from .ntfy_inbox import NTFY_OWN
 
-            targets["ntfy"] = NtfyTarget(NtfyClient(config.ntfy_url, config.ntfy_token))
+            targets["ntfy"] = NtfyTarget(NtfyClient(config.ntfy_url, config.ntfy_token, own=NTFY_OWN))
         if telegram is None and config.telegram_token:
             from .telegram import TelegramTarget  # telegram imports this module
 
