@@ -79,7 +79,7 @@ class FakeRuntime:
 def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(assistant_mod, "reply_lines", lambda reply, config_dir, **kw: [str(reply)])
     config = Config(state_dir=tmp_path / "state", status_dir=tmp_path / "s", approval_pin="918273",
-                    telegram_max_turns_per_hour=30)
+                    telegram_max_turns_per_hour=30, claude_oauth_token="synthetic-oauth")
     topic, own, runtime = Topic(), OwnMessages(), FakeRuntime()
     client = FakeClient(topic, own)
     inbox = NtfyInbox(config, client, lambda: runtime, own=own, clock=lambda: NOW + 5)
@@ -215,3 +215,15 @@ def test_router_treats_ntfy_like_telegram_for_mail_rules():
     config = SimpleNamespace(small_model=None, small_max_chars=0)
     router = Router(SimpleNamespace(), None, None, config, statuses=lambda: [], channel="ntfy")
     assert router.channel == "telegram"
+
+
+def test_without_a_login_questions_get_a_hint_and_no_model_starts(setup):
+    s = setup
+    s.config.__dict__["claude_oauth_token"] = None  # and no credentials file in the empty config dir
+    s.topic.add("what is on today?")
+    s.topic.add("help")
+    s.inbox.poll_once()
+    drain(s.inbox)
+    assert s.runtime.turns == ["help"]
+    replies = [m["message"] for m in s.topic.messages if NTFY_OWN_TAG in m.get("tags", [])]
+    assert "Claude login" in replies[0] and replies[1] == "answer to help"

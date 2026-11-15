@@ -65,6 +65,8 @@ TEXTS = {
         "new": "Neues Gespräch begonnen.",
         "unavailable": "Der Assistent ist gerade nicht erreichbar ({reason}).",
         "error": "Die Antwort ist fehlgeschlagen ({reason}).",
+        "no_login": "Fragen ans Modell gehen erst, wenn der Agent einen eigenen Claude-Login hat "
+                    "(CLAUDE_CODE_OAUTH_TOKEN). Feste Befehle (help, status, note …) gehen schon.",
     },
     "en": {
         "approval": "This needs an approval ({tool}). ntfy has no approvals: please use the chat or the approval page.",
@@ -76,6 +78,8 @@ TEXTS = {
         "new": "Started a new conversation.",
         "unavailable": "The assistant is not available right now ({reason}).",
         "error": "The reply failed ({reason}).",
+        "no_login": "Questions to the model work once the agent has its own Claude login "
+                    "(CLAUDE_CODE_OAUTH_TOKEN). Fixed commands (help, status, note …) already work.",
     },
 }
 
@@ -259,6 +263,9 @@ class NtfyInbox:
             self.reply(self.texts["new"])
             return True
         assert text is not None
+        if not runtime.router.is_tier1(text) and not self._has_login():
+            self.reply(self.texts["no_login"])  # no Claude process is started without a login
+            return True
         if not self._turn_allowed(runtime, text):
             self.reply(self.texts["limit"])
             return True
@@ -271,6 +278,16 @@ class NtfyInbox:
             self._last_turn = self.monotonic()
         self.reply("\n".join(reply_lines(result, runtime.parts.config_dir, prefix="", local_paths=False)))
         return True
+
+    def _has_login(self) -> bool:
+        """A login the agent's own Claude process can use: an API key, an OAuth token, or a
+        credentials file in its separate config directory."""
+        config = self.config
+        if config.access_mode == "api":
+            return bool(config.claude_api_key)
+        if config.claude_oauth_token:
+            return True
+        return (config.bridge_paths()[1] / ".credentials.json").is_file()
 
     def _maybe_idle_close(self) -> None:
         if self._runtime is not None and self.monotonic() - self._last_turn >= IDLE_CLOSE_S:
