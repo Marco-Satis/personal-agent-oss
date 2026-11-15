@@ -460,6 +460,15 @@ limited to ten per ten minutes and the same event key to one per hour; info noti
 | `PA_NOTIFY_TASK_DETAIL` | `counts` | `title` adds task id, status and cleaned title to task notices |
 | `PA_TELEGRAM_TOKEN` | – | Telegram bot token (a secret, never logged or shown); needed by any `telegram` route |
 
+### ntfy (your own push server)
+
+Set `PA_NTFY_URL` to the full topic URL of your own ntfy server (`https://host/topic`; plain `http` only
+on this machine) and, with access control, `PA_NTFY_TOKEN` (`tk_…`). Both are secrets and never logged.
+ntfy is opt-in per kind: `PA_NOTIFY_BRIEF=ntfy`, `PA_NOTIFY_ALERT=ntfy`, `PA_NOTIFY_INFO=ntfy`,
+`PA_NOTIFY_TASK_DONE=ntfy` (or combined, e.g. `telegram,ntfy`). Approvals never go to ntfy: it has no
+approval buttons, use Telegram or the approval page. Messages are plain text (no markdown, links
+defanged), split at 3800 bytes, at most three per notice. The brief on ntfy follows `PA_BRIEF_TELEGRAM`.
+
 ### Telegram
 
 A Telegram bot brings the agent to your phone: notices, approvals with buttons, and a chat with the same

@@ -127,6 +127,37 @@ def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipa
     return tuple(networks)
 
 
+NTFY_TOKEN_RE = re.compile(r"^tk_[A-Za-z0-9]{20,64}$")
+
+
+def _parse_ntfy_url(raw: str | None) -> str | None:
+    """PA_NTFY_URL: the full topic URL of your own ntfy server (https, or http on this machine).
+
+    It is treated as a secret (a topic name is a password on servers without access control)."""
+    if not raw:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = parts.hostname
+    except ValueError as exc:
+        raise ConfigError("PA_NTFY_URL is not a valid URL") from exc
+    local = host in ("127.0.0.1", "localhost", "::1")
+    topic = parts.path.strip("/")
+    if (parts.scheme != "https" and not (parts.scheme == "http" and local)) or not host or parts.query \
+            or parts.fragment or parts.username or not topic or "/" in topic:
+        raise ConfigError("PA_NTFY_URL must look like https://host/topic (http only on this machine)")
+    return raw.rstrip("/")
+
+
+def _parse_ntfy_token(raw: str | None) -> str | None:
+    """PA_NTFY_TOKEN: an ntfy access token (secret). The error never contains the value."""
+    if not raw:
+        return None
+    if not NTFY_TOKEN_RE.fullmatch(raw):
+        raise ConfigError("PA_NTFY_TOKEN must look like tk_<letters and digits>, as issued by ntfy")
+    return raw
+
+
 TELEGRAM_TOKEN_RE = re.compile(r"^(\d{5,16}):([A-Za-z0-9_-]{30,64})$")
 
 
@@ -140,11 +171,11 @@ def _parse_telegram_token(raw: str | None) -> str | None:
 
 
 NOTIFY_KINDS = ("brief", "alert", "approval", "task_done", "info")
-NOTIFY_TARGETS = ("telegram", "discord")
+NOTIFY_TARGETS = ("telegram", "discord", "ntfy")
 
 
 def _parse_route(kind: str, raw: str | None) -> tuple[str, ...] | None:
-    """PA_NOTIFY_<KIND>: a comma list of telegram, discord or none. None means: default rule."""
+    """PA_NOTIFY_<KIND>: a comma list of telegram, discord, ntfy or none. None means: default rule."""
     if raw is None:
         return None
     name = f"PA_NOTIFY_{kind.upper()}"
@@ -154,11 +185,11 @@ def _parse_route(kind: str, raw: str | None) -> tuple[str, ...] | None:
         if not value:
             continue
         if value not in NOTIFY_TARGETS + ("none",):
-            raise ConfigError(f"{name} must be a comma-separated list of telegram, discord or none")
+            raise ConfigError(f"{name} must be a comma-separated list of telegram, discord, ntfy or none")
         if value not in values:
             values.append(value)
     if not values:
-        raise ConfigError(f"{name} must be a comma-separated list of telegram, discord or none")
+        raise ConfigError(f"{name} must be a comma-separated list of telegram, discord, ntfy or none")
     if "none" in values and len(values) > 1:
         raise ConfigError(f"{name}: none cannot be combined with a channel")
     if kind == "approval" and len(values) > 1:
@@ -167,9 +198,14 @@ def _parse_route(kind: str, raw: str | None) -> tuple[str, ...] | None:
 
 
 def _validate_routes(routes: tuple[tuple[str, tuple[str, ...]], ...], telegram_token: str | None,
-                     discord_webhook: str | None, public_approval_url: str | None) -> None:
+                     discord_webhook: str | None, public_approval_url: str | None,
+                     ntfy_url: str | None = None) -> None:
     for kind, route in routes:
         name = f"PA_NOTIFY_{kind.upper()}"
+        if "ntfy" in route and not ntfy_url:
+            raise ConfigError(f"{name}=ntfy needs PA_NTFY_URL")
+        if kind == "approval" and "ntfy" in route:
+            raise ConfigError("PA_NOTIFY_APPROVAL cannot be ntfy (no approval buttons there); use telegram or discord")
         if "telegram" in route and not telegram_token:
             raise ConfigError(f"{name}=telegram needs PA_TELEGRAM_TOKEN")
         if "discord" in route and not discord_webhook:
@@ -300,6 +336,8 @@ class Config:
     domain_context_chars: int = 4000  # PA_DOMAIN_CONTEXT_CHARS: domain notes per helper prompt, 0 = none
     sessions_source: str = "hooks"   # PA_SESSIONS_SOURCE: hooks | agents | both (chat `sessions` only)
     telegram_token: str | None = field(default=None, repr=False)  # PA_TELEGRAM_TOKEN (secret)
+    ntfy_url: str | None = field(default=None, repr=False)  # PA_NTFY_URL (full topic URL, secret)
+    ntfy_token: str | None = field(default=None, repr=False)  # PA_NTFY_TOKEN (secret, optional)
     # PA_NOTIFY_<KIND>, only the kinds set explicitly, e.g. (("alert", ("discord",)),)
     notify_routes: tuple[tuple[str, tuple[str, ...]], ...] = ()
     brief_telegram: str = "full"       # PA_BRIEF_TELEGRAM: what the brief shows on Telegram
@@ -439,7 +477,11 @@ class Config:
             (kind, route) for kind in NOTIFY_KINDS
             if (route := _parse_route(kind, _env(f"PA_NOTIFY_{kind.upper()}"))) is not None
         )
-        _validate_routes(notify_routes, telegram_token, discord_webhook, public_approval_url)
+        ntfy_url = _parse_ntfy_url(_env("PA_NTFY_URL"))
+        ntfy_token = _parse_ntfy_token(_env("PA_NTFY_TOKEN"))
+        if ntfy_token and not ntfy_url:
+            raise ConfigError("PA_NTFY_TOKEN is set but PA_NTFY_URL is not")
+        _validate_routes(notify_routes, telegram_token, discord_webhook, public_approval_url, ntfy_url)
         brief_telegram = (_env("PA_BRIEF_TELEGRAM", "full") or "full").lower()
         if brief_telegram not in BRIEF_TELEGRAM_MODES:
             raise ConfigError("PA_BRIEF_TELEGRAM must be 'counts' or 'full'")
@@ -525,6 +567,8 @@ class Config:
             router_small_model=small_model,
             router_small_max_chars=small_max_chars,
             discord_webhook=discord_webhook,
+            ntfy_url=ntfy_url,
+            ntfy_token=ntfy_token,
             public_approval_url=public_approval_url,
             approval_pin=approval_pin,
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),

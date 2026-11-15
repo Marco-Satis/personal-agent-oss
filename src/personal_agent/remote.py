@@ -168,6 +168,45 @@ class DiscordWebhook:
         return True
 
 
+class NtfyClient:
+    """Posts plain text to one ntfy topic. URL and token are secrets and never logged."""
+
+    def __init__(self, url: str, token: str | None = None, timeout_s: int = 10, opener: Callable | None = None) -> None:
+        self._url = url
+        self._token = token
+        self.timeout_s = timeout_s
+        self._opener = opener or urllib.request.build_opener(_NoRedirect()).open
+
+    def __repr__(self) -> str:
+        return "NtfyClient(<hidden>)"
+
+    def post(self, text: str, title: str | None = None, priority: int | None = None) -> bool:
+        try:
+            request = urllib.request.Request(self._url, data=text.encode("utf-8")[:4000], method="POST")
+            request.add_header("Content-Type", "text/plain; charset=utf-8")
+            request.add_header("User-Agent", f"personal-agent/{__version__}")
+            request.add_header("Markdown", "no")
+            if title:
+                request.add_header("Title", title.encode("ascii", "replace").decode()[:80])
+            if priority is not None:
+                request.add_header("Priority", str(max(1, min(5, int(priority)))))
+            if self._token:
+                request.add_header("Authorization", f"Bearer {self._token}")
+            with self._opener(request, timeout=self.timeout_s) as response:
+                code = getattr(response, "status", None) or response.getcode()
+        except urllib.error.HTTPError as exc:
+            _close_quietly(exc)
+            log.warning("ntfy post failed: HTTPError %s", exc.code)
+            return False
+        except Exception as exc:  # noqa: BLE001 - messages of some errors contain the URL
+            log.warning("ntfy post failed: %s", type(exc).__name__)
+            return False
+        if not 200 <= int(code) < 300:
+            log.warning("ntfy post failed: HTTP %s", code)
+            return False
+        return True
+
+
 # --- the inbox in the server process -------------------------------------------
 
 

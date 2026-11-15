@@ -8,8 +8,8 @@ Kinds of notices:
   task_done  task counts, optionally ids and titles (coordinator.TaskNotifier)
   info       fixed operational notices (e.g. the morning brief gave up for today)
 
-PA_NOTIFY_<KIND> picks the channels: a comma list of `telegram`, `discord`, or
-`none`. Unset, a kind goes to Telegram when a paired Telegram bot is ready, and
+PA_NOTIFY_<KIND> picks the channels: a comma list of `telegram`, `discord`, `ntfy` or
+`none`. ntfy (your own server, PA_NTFY_URL) is opt-in per kind and never carries approvals. Unset, a kind goes to Telegram when a paired Telegram bot is ready, and
 otherwise to Discord as before: the brief when PA_DISCORD_WEBHOOK is set,
 approvals when the webhook and PA_PUBLIC_APPROVAL_URL are set, task counts only
 with PA_TASK_DISCORD=counts. Alerts and info notices are opt-in on Discord.
@@ -54,6 +54,8 @@ DISCORD_MAX_CHUNKS = 5
 TELEGRAM_API_LIMIT = 4096     # UTF-16 code units per Telegram message
 TELEGRAM_LIMIT = 4000         # kept with margin
 TELEGRAM_MAX_CHUNKS = 5
+NTFY_LIMIT = 3800             # ntfy takes 4096 bytes per message; measured in UTF-8 bytes, with margin
+NTFY_MAX_CHUNKS = 3
 CHUNK_GAP_S = 0.6             # between two chunks of one notice
 QUEUE_SIZE = 50
 RATE_WINDOW_S = 10 * 60       # alert and info: at most RATE_LIMIT per window ...
@@ -74,6 +76,10 @@ _TASK_STATES = ("done", "failed", "cancelled")
 def utf16_len(text: str) -> int:
     """Length in UTF-16 code units (the unit of Telegram's message limit)."""
     return len(text.encode("utf-16-le")) // 2
+
+
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
 
 
 def defang(text: str) -> str:
@@ -123,6 +129,8 @@ def channel_limits(name: str) -> tuple[int, int, Callable[[str], int]]:
     """(limit, max_chunks, measure) of a channel."""
     if name == "telegram":
         return TELEGRAM_LIMIT, TELEGRAM_MAX_CHUNKS, utf16_len
+    if name == "ntfy":
+        return NTFY_LIMIT, NTFY_MAX_CHUNKS, utf8_len
     return DISCORD_LIMIT, DISCORD_MAX_CHUNKS, len
 
 
@@ -180,7 +188,7 @@ def split_message(text: str, limit: int, max_chunks: int, measure: Callable[[str
 
 
 class Target(Protocol):
-    name: str          # "telegram" | "discord"
+    name: str          # "telegram" | "discord" | "ntfy"
     limit: int         # max size of one message in the channel's own unit
     max_chunks: int
 
@@ -217,6 +225,36 @@ class DiscordTarget:
             return bool(self.webhook.post(text))  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 - a notice never raises; the message may hold the URL
             log.warning("discord post failed: %s", type(exc).__name__)
+            return False
+
+
+class NtfyTarget:
+    """Your own ntfy topic as a notification channel: plain text, no markdown, no links."""
+
+    name = "ntfy"
+    limit = NTFY_LIMIT
+    max_chunks = NTFY_MAX_CHUNKS
+
+    def __init__(self, client: object) -> None:
+        self.client = client  # anything with .post(text) -> bool, usually remote.NtfyClient
+
+    def __repr__(self) -> str:
+        return "NtfyTarget(<hidden>)"
+
+    def measure(self, text: str) -> int:
+        return utf8_len(text)
+
+    def inert(self, text: object, limit: int = 160) -> str:
+        return plain_line(text, limit)
+
+    def ready(self) -> str | None:
+        return None
+
+    def post(self, text: str) -> bool:
+        try:
+            return bool(self.client.post(text))  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - a notice never raises; the message may hold the URL
+            log.warning("ntfy post failed: %s", type(exc).__name__)
             return False
 
 
@@ -447,6 +485,10 @@ class Notifier:
             from .remote import DiscordWebhook  # remote imports this module
 
             targets["discord"] = DiscordTarget(DiscordWebhook(config.discord_webhook))
+        if config.ntfy_url:
+            from .remote import NtfyClient
+
+            targets["ntfy"] = NtfyTarget(NtfyClient(config.ntfy_url, config.ntfy_token))
         if telegram is None and config.telegram_token:
             from .telegram import TelegramTarget  # telegram imports this module
 
@@ -630,7 +672,7 @@ class NotifierPost:
 
 __all__ = [
     "ASYNC_KINDS", "DISCORD_LIMIT", "DISCORD_MAX_CHUNKS", "KINDS", "TARGET_NAMES", "TELEGRAM_LIMIT",
-    "TELEGRAM_MAX_CHUNKS", "DiscordTarget", "Notifier", "NotifierPost", "Target", "alert_notice", "alert_outcome",
+    "TELEGRAM_MAX_CHUNKS", "DiscordTarget", "NtfyTarget", "Notifier", "NotifierPost", "Target", "alert_notice", "alert_outcome",
     "channel_limits", "defang", "discord_line", "discord_safe", "info_notice", "plain_line", "render_approval_notice",
     "resolve_route", "split_message", "task_counts_notice", "task_detail_notice", "telegram_untrusted", "utf16_len",
 ]
