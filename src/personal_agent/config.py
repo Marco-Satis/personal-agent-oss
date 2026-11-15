@@ -621,8 +621,9 @@ class Config:
             raise ConfigError("PA_PUBLIC_URL must be an https:// URL when using Twilio")
         if self.public_approval_url and not (self.discord_webhook or self.telegram_token):
             raise ConfigError("PA_PUBLIC_APPROVAL_URL needs PA_DISCORD_WEBHOOK or PA_TELEGRAM_TOKEN")
-        if self.brief_time is not None and not (self.discord_webhook or self.telegram_token):
-            raise ConfigError("PA_BRIEF_TIME needs PA_DISCORD_WEBHOOK or PA_TELEGRAM_TOKEN")
+        if self.brief_time is not None and not (self.discord_webhook or self.telegram_token
+                                                or "ntfy" in (self.route("brief") or ())):
+            raise ConfigError("PA_BRIEF_TIME needs PA_DISCORD_WEBHOOK, PA_TELEGRAM_TOKEN or PA_NOTIFY_BRIEF=ntfy")
         if self.remote_approvals:
             # With Telegram, turns that start in Telegram always ask there: level 3 must be
             # deniable safely, so the PIN is required as soon as the token is set.

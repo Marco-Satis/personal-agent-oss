@@ -144,3 +144,17 @@ def test_notifier_delivers_to_ntfy_when_routed(tmp_path, env):
     notifier.targets["ntfy"] = NtfyTarget(client)
     notifier.send("info", info_notice("brief_gave_up"))
     assert len(client.posts) == 1 and client.posts[0]
+
+
+def test_brief_time_with_only_ntfy_passes_the_serve_check(env):
+    env.setenv("PA_API_TOKEN", "x" * 32)
+    env.setenv("PA_CALL_TO", "+447700900123")
+    env.setenv("PA_CALL_PIN", "123456")
+    env.setenv("PA_BRIEF_TIME", "07:30")
+    env.setenv("PA_NTFY_URL", URL)
+    with pytest.raises(ConfigError, match="PA_NOTIFY_BRIEF=ntfy"):
+        Config.from_env().validate_for_serve()  # ntfy set but not routed: still no channel for the brief
+    env.setenv("PA_NOTIFY_BRIEF", "ntfy")
+    config = Config.from_env()
+    config.validate_for_serve()
+    assert [t.name for t in Notifier.from_config(config, run_thread=False).targets_for("brief")] == ["ntfy"]
