@@ -41,7 +41,7 @@ def test_cli_has_no_command_that_sends_to_a_session():
         "serve", "escalate", "status", "simulate", "chat", "vault", "plugins", "brief", "hooks", "telegram", "safety",
         "modules", "mail", "backup", "audit"}
     assert set(_subcommands(commands["telegram"])) == {"pair", "status", "unpair"}
-    assert set(_subcommands(commands["backup"])) == {"create", "list", "verify"}  # no restore over live data
+    assert set(_subcommands(commands["backup"])) == {"create", "list", "verify", "extract"}  # extract: empty folder only
     assert set(_subcommands(commands["hooks"])) == {"snippet"}
     assert set(_subcommands(commands["mail"])) == {"check"}  # read-only: nothing that sends mail
 

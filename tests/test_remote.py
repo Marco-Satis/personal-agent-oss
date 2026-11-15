@@ -437,6 +437,9 @@ def test_approve_page_and_security_headers(served):
     assert code == 200
     for name, value in PAGE_HEADERS.items():
         assert headers[name] == value
+    # pinned, not just "equals the constant": with no-referrer, Chromium sends `Origin: null` on the form POST
+    # and _origin_ok rejects every real approval (checked in a browser 15.11.2026, AOS-PA-02)
+    assert headers["Referrer-Policy"] == "same-origin"
     assert headers["Content-Type"] == "text/html; charset=utf-8"
     assert "<script>" not in page and "&lt;script&gt;" in page
     assert "Write" in page and 'type="hidden" name="csrf"' in page

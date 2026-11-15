@@ -196,5 +196,42 @@ def verify_backup(path: Path) -> VerifyResult:
     return VerifyResult(files, tuple(sorted(roots)), tuple(problems))
 
 
-__all__ = ["BackupError", "BackupResult", "VerifyResult", "backup_dir", "create_backup", "list_backups",
-           "verify_backup"]
+def extract_backup(path: Path, dest: Path) -> int:
+    """Unpack a checked archive into an empty or new folder; returns the number of files.
+
+    Never writes over live data: `dest` must not exist or be empty. Only regular files and folders
+    are written (0600/0700), names were checked by verify_backup first. Switching the agent to the
+    restored copy (PA_STATE_DIR) stays a manual step.
+    """
+    check = verify_backup(path)
+    if not check.ok:
+        raise BackupError("the archive did not pass the check: " + "; ".join(check.problems))
+    dest = Path(dest)
+    if dest.exists() and (not dest.is_dir() or any(dest.iterdir())):
+        raise BackupError("the target folder must be new or empty")
+    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = dest.resolve()
+    files = 0
+    with tarfile.open(path, mode="r:gz") as tar:
+        for member in tar:
+            target = (root / member.name).resolve()
+            if root not in target.parents and target != root:
+                raise BackupError("unexpected path in archive")  # verify_backup should have caught it
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            handle = tar.extractfile(member)
+            if handle is None:
+                raise BackupError("unreadable member")
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                while chunk := handle.read(1 << 16):
+                    out.write(chunk)
+            os.utime(target, (member.mtime, member.mtime))
+            files += 1
+    return files
+
+
+__all__ = ["BackupError", "BackupResult", "VerifyResult", "backup_dir", "create_backup", "extract_backup",
+           "list_backups", "verify_backup"]

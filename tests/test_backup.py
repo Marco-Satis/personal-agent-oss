@@ -145,3 +145,50 @@ def test_sockets_are_skipped(tmp_path):
     finally:
         sock.close()
     assert "state/s.sock" not in names(result.path)
+
+
+def _tree(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file() and not p.is_symlink()}
+
+
+def test_restore_probe_gives_back_every_packed_file_byte_for_byte(tmp_path):
+    from personal_agent.backup import extract_backup
+
+    state, vault = tmp_path / "state", tmp_path / "vault"
+    fill(state, vault)
+    (state / "big.bin").write_bytes(os.urandom(300_000))
+    result = create_backup(state, vault, now=NOW)
+    restored = tmp_path / "restored"
+    assert extract_backup(result.path, restored) == result.files == 4
+    expected = {k: v for k, v in _tree(state).items()
+                if not k.startswith(("run/", "claude-config/", "backups/")) and not k.endswith((".lock", ".tmp"))}
+    assert _tree(restored / "state") == expected
+    assert _tree(restored / "vault") == _tree(vault)
+    assert stat.S_IMODE(os.stat(restored / "state" / "big.bin").st_mode) == 0o600
+
+
+def test_extract_never_writes_into_a_used_folder_or_from_a_bad_archive(tmp_path):
+    from personal_agent.backup import extract_backup
+
+    state = tmp_path / "state"
+    fill(state)
+    result = create_backup(state, tmp_path / "none", now=NOW)
+    with pytest.raises(BackupError):
+        extract_backup(result.path, state)  # live data
+    bad = tmp_path / "bad.tar.gz"
+    _archive(bad, [("state/a", "file"), ("../evil", "file")])
+    with pytest.raises(BackupError):
+        extract_backup(bad, tmp_path / "new")
+    assert not (tmp_path / "evil").exists() and not (tmp_path / "new").exists()
+
+
+def test_cli_extract(tmp_path, monkeypatch, capsys):
+    state = tmp_path / "state"
+    fill(state)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PA_STATE_DIR", str(state))
+    assert main(["backup", "create"]) == 0
+    capsys.readouterr()
+    assert main(["backup", "extract", str(tmp_path / "copy")]) == 0
+    assert "unpacked" in capsys.readouterr().out and (tmp_path / "copy" / "state" / "wiki" / "note.md").exists()
+    assert main(["backup", "extract", str(tmp_path / "copy")]) == 1  # not empty any more

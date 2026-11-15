@@ -597,7 +597,7 @@ def _cmd_audit(config: Config, args: argparse.Namespace) -> int:
 
 def _cmd_backup(config: Config, args: argparse.Namespace) -> int:
     """Pack, list or check backups of the state directory and the vault (never restores)."""
-    from .backup import BackupError, backup_dir, create_backup, list_backups, verify_backup
+    from .backup import BackupError, backup_dir, create_backup, extract_backup, list_backups, verify_backup
 
     target = backup_dir(config.state_dir, args.dir)
     if args.backup_command == "create":
@@ -624,6 +624,15 @@ def _cmd_backup(config: Config, args: argparse.Namespace) -> int:
     if path is None:
         print(f"no backups in {target}", file=sys.stderr)
         return 1
+    if args.backup_command == "extract":
+        try:
+            count = extract_backup(path, args.target)
+        except (BackupError, OSError) as exc:
+            print(f"extract failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"{path.name}: {count} files unpacked into {args.target}")
+        print("to use it: stop the agent, set PA_STATE_DIR to the state/ folder in there, run `claude setup-token`")
+        return 0
     check = verify_backup(path)
     print(f"{path.name}: {check.files} files in {', '.join(check.roots) or '-'}; "
           + ("ok" if check.ok else "FAILED: " + "; ".join(check.problems)))
@@ -768,6 +777,9 @@ def build_parser() -> argparse.ArgumentParser:
     backup_sub.add_parser("list", help="list the archives")
     verify = backup_sub.add_parser("verify", help="read every file of an archive (default: the newest)")
     verify.add_argument("path", nargs="?", help="archive to check")
+    extract = backup_sub.add_parser("extract", help="unpack an archive into a NEW or empty folder (never over live data)")
+    extract.add_argument("target", type=Path, help="new or empty folder")
+    extract.add_argument("path", nargs="?", help="archive (default: the newest)")
 
     mail = sub.add_parser("mail", help="the read-only mail reader (PA_MAIL_CONFIG)")
     mail_sub = mail.add_subparsers(dest="mail_command", required=True)

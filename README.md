@@ -614,13 +614,16 @@ logged. The file is 0600 and capped at 1 MB. `personal-agent audit [--last N]` s
 personal-agent backup create            # pack state + vault, check the archive, keep the newest 7
 personal-agent backup list
 personal-agent backup verify [ARCHIVE]  # read every file of an archive (default: the newest)
+personal-agent backup extract NEW_DIR [ARCHIVE]  # unpack into a new or empty folder
 ```
 
 Archives go to `$PA_STATE_DIR/backups` (or `--dir`), 0600 in a 0700 folder. They hold the state
 directory and the vault, but not the Claude Code login (`claude-config`), runtime files (`run/`,
 locks, sockets) or symlinks; after a restore, run `claude setup-token` again. The archives contain
 private data, and a copy on the same disk does not survive the disk: copy them off the machine.
-Restoring is manual for now (`tar -xzf` into an empty folder, then point `PA_STATE_DIR` at it).
+To restore, `personal-agent backup extract <new-folder> [ARCHIVE]` unpacks a checked archive into a new or
+empty folder only (never over live data); then stop the agent, point `PA_STATE_DIR` at the `state/` folder
+in there and run `claude setup-token`.
 
 ## Connect your Claude Code sessions
 
