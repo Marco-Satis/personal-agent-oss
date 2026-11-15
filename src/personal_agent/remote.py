@@ -173,6 +173,10 @@ class DiscordWebhook:
 NTFY_OWN_TAG = "pa-agent"  # every message the agent sends carries it; the inbox skips them (no loops)
 
 
+class NtfyRateLimited(OSError):
+    """The ntfy server answered 429: the caller waits longer before the next request."""
+
+
 class OwnMessages:
     """Ids of the ntfy messages this process sent (bounded). Second guard next to the tag."""
 
@@ -253,6 +257,8 @@ class NtfyClient:
                 raw = response.read(512 * 1024)
         except urllib.error.HTTPError as exc:
             _close_quietly(exc)
+            if exc.code == 429:
+                raise NtfyRateLimited("ntfy poll: HTTP 429") from None
             raise OSError(f"ntfy poll failed: HTTP {exc.code}") from None
         out = []
         for line in raw.decode("utf-8", "replace").splitlines():

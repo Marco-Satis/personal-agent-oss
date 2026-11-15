@@ -227,3 +227,28 @@ def test_without_a_login_questions_get_a_hint_and_no_model_starts(setup):
     assert s.runtime.turns == ["help"]
     replies = [m["message"] for m in s.topic.messages if NTFY_OWN_TAG in m.get("tags", [])]
     assert "Claude login" in replies[0] and replies[1] == "answer to help"
+
+
+def test_polling_is_gentle_and_backs_off_on_429(setup):
+    from personal_agent import ntfy_inbox
+    from personal_agent.remote import NtfyRateLimited
+
+    inbox = setup.inbox
+    assert ntfy_inbox.POLL_S >= 15  # one shared rate bucket for every local client of the server
+    assert inbox.next_delay(5, None) == ntfy_inbox.POLL_S
+    assert inbox.next_delay(ntfy_inbox.POLL_S, NtfyRateLimited("429")) == 60
+    assert inbox.next_delay(60, NtfyRateLimited("429")) == 120
+    assert inbox.next_delay(500, NtfyRateLimited("429")) == ntfy_inbox.MAX_BACKOFF_S
+    assert inbox.next_delay(20, OSError("down")) == 40
+
+
+def test_client_turns_a_429_into_rate_limited():
+    import urllib.error
+
+    from personal_agent.remote import NtfyRateLimited
+
+    def opener(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b""))
+
+    with pytest.raises(NtfyRateLimited):
+        NtfyClient(URL, TOKEN, opener=opener).poll("1")

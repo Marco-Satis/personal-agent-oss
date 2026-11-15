@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from .remote import NTFY_OWN_TAG, NtfyClient, OwnMessages
+from .remote import NTFY_OWN_TAG, NtfyClient, NtfyRateLimited, OwnMessages
 from .statefiles import read_private_json, write_private_json
 
 if TYPE_CHECKING:
@@ -43,8 +43,11 @@ log = logging.getLogger(__name__)
 NTFY_OWN = OwnMessages()  # process-wide: the notifier and the inbox share it
 STATE_FILE = "ntfy_inbox.json"
 STATE_VERSION = 1
-POLL_S = 5.0
-MAX_BACKOFF_S = 300.0
+# All local clients of the ntfy server share one rate bucket (127.0.0.1): every poll counts.
+# 20 s keeps this inbox at 3 requests a minute; a 429 waits at least RATE_LIMITED_S and doubles.
+POLL_S = 20.0
+RATE_LIMITED_S = 60.0
+MAX_BACKOFF_S = 600.0
 STALE_S = 600
 MAX_PER_MIN = 20
 MAX_TEXT = 4000
@@ -306,15 +309,25 @@ class NtfyInbox:
             self._threads.append(thread)
         log.info("ntfy inbox on: messages in the notice topic are read as yours (approvals never)")
 
+    def next_delay(self, delay: float, error: Exception | None) -> float:
+        """Seconds until the next poll: POLL_S after success, doubling after errors, at least
+        RATE_LIMITED_S after a 429, never more than MAX_BACKOFF_S."""
+        if error is None:
+            return POLL_S
+        if isinstance(error, NtfyRateLimited):
+            return min(MAX_BACKOFF_S, max(RATE_LIMITED_S, delay * 2))
+        return min(MAX_BACKOFF_S, delay * 2)
+
     def _poll_loop(self) -> None:
         delay = POLL_S
         while not self._stop.is_set():
+            error: Exception | None = None
             try:
                 self.poll_once()
-                delay = POLL_S
             except Exception as exc:  # noqa: BLE001 - network or server trouble: back off and retry
+                error = exc
                 log.warning("ntfy poll failed: %s", type(exc).__name__)
-                delay = min(MAX_BACKOFF_S, delay * 2)
+            delay = self.next_delay(delay, error)
             self._stop.wait(delay)
 
     def _work_loop(self) -> None:
