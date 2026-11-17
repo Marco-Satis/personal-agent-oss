@@ -328,3 +328,34 @@ def test_brief_and_evening_views(store):
     evening = svc.evening_lines()
     assert evening[0] == "Heute erledigt: 1: Steuer" and evening[1] == "Noch offen in deinem Fokus: #1 Angebot"
     assert evening[2].startswith("Rückblick:")
+
+
+def test_brief_and_evening_read_the_lists_without_creating_them(tmp_path):
+    from datetime import date
+
+    from personal_agent.brief import BriefData, focus_summary, render_markdown, render_plain
+    from personal_agent.config import Config
+    from personal_agent.focus import OWNER_ID
+    from personal_agent.rhythm import focus_evening_lines
+
+    config = Config(state_dir=tmp_path, status_dir=tmp_path / "s", language="de")
+    assert focus_summary(config, T0) == ("", ()) and focus_evening_lines(config, T0) == []
+    assert not (tmp_path / DB_FILE).exists()  # nothing created just for reading
+    store = FocusStore(tmp_path, clock=lambda: T0)
+    me = Person(OWNER_ID)
+    store.add(me, "Angebot <b>", "focus")
+    store.add(me, "Steuer", "focus", owner=SHARED)
+    counts, lines = focus_summary(config, T0)
+    assert counts.startswith("dein Fokus 1/3 offen") and lines[0] == "Fokus · du: #1 Angebot <b>"
+    data = BriefData(day=date(2026, 11, 17), weekday="Dienstag", now_ts=T0, has_vault=False, focus="", tasks=(),
+                     task_total=0, status_counts=(), statuses=(), quota="q", captures=0, since_text="07:30",
+                     lists=counts, list_lines=lines)
+    md = render_markdown(data, "de")
+    assert "## Listen" in md and "- Fokus · du: #1 Angebot <b>" in md
+    assert "Listen: dein Fokus 1/3 offen" in render_plain(data, "de", "counts", "outputs/x.md")
+    assert "Angebot" not in render_plain(data, "de", "counts", "outputs/x.md")  # counts mode: no item text
+    assert "Angebot" in render_plain(data, "de", "full", "outputs/x.md")
+    store.complete(me, 1)
+    assert focus_evening_lines(config, T0 + 60)[0] == "Heute erledigt: 1: Angebot <b>"
+    off = Config(state_dir=tmp_path, status_dir=tmp_path / "s", modules=("brief",))
+    assert focus_summary(off, T0) == ("", ()) and focus_evening_lines(off, T0) == []

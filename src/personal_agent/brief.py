@@ -119,6 +119,7 @@ TEXTS = {
         "sessions": "Claude Code sessions",
         "quota": "Quota",
         "mail": "Mail",
+        "lists": "Lists",
         "inbox": "Inbox",
         "empty": "(empty)",
         "none": "(none)",
@@ -137,6 +138,7 @@ TEXTS = {
         "sessions": "Claude-Code-Sessions",
         "quota": "Kontingent",
         "mail": "Mail",
+        "lists": "Listen",
         "inbox": "Eingang",
         "empty": "(leer)",
         "none": "(keine)",
@@ -201,6 +203,8 @@ class BriefData:
     captures: int
     since_text: str
     mail: str = ""  # one line from the mail cache (categories, mailbox problems); "" without mail
+    lists: str = ""  # one line of counts from the focus lists (module "focus"); "" without
+    list_lines: tuple[str, ...] = ()  # the focus lists with item texts (full mode only)
 
 
 def mail_summary(config: "Config", now_ts: float) -> str:
@@ -224,6 +228,24 @@ def mail_summary(config: "Config", now_ts: float) -> str:
     notes = health_notes(view, now_ts, config.language)
     return text + ("" if not notes else " · " + " · ".join(notes))
 
+
+
+def focus_summary(config: "Config", now_ts: float) -> tuple[str, tuple[str, ...]]:
+    """(counts line, list lines) from the focus lists; never creates the database."""
+    if "focus" not in getattr(config, "modules", ()):
+        return "", ()
+    try:
+        from .focus import DB_FILE, OWNER_ID, FocusService, FocusStore, Person
+
+        if not (Path(config.state_dir) / DB_FILE).is_file():
+            return "", ()
+        service = FocusService(FocusStore(config.state_dir, clock=lambda: now_ts), Person(OWNER_ID),
+                               config.language)
+        counts, lines = service.brief_view()
+    except Exception as exc:  # noqa: BLE001 - the brief never fails because of the lists
+        log.warning("brief: focus lists unreadable (%s)", type(exc).__name__)
+        return "", ()
+    return counts, tuple(lines)
 
 
 def _texts(language: str) -> dict[str, str]:
@@ -293,6 +315,8 @@ def render_markdown(data: BriefData, language: str = "en") -> str:
     lines += ["", f"## {t['quota']}", data.quota]
     if data.mail:
         lines += ["", f"## {t['mail']}", data.mail]
+    if data.lists:
+        lines += ["", f"## {t['lists']}", data.lists, *(f"- {line}" for line in data.list_lines)]
     lines += ["", f"## {t['inbox']}"]
     if data.has_vault:
         lines.append(t["captures"].format(n=data.captures, since=data.since_text))
@@ -337,6 +361,7 @@ def render_discord(data: BriefData, language: str, mode: str, full_path: str,
             f"{t['sessions']}: {_counts_text(data) or t['no_status']}",
             f"{t['quota']}: {_discord_plain(data.quota)}",
             *([f"{t['mail']}: {_discord_plain(data.mail)}"] if data.mail else []),
+            *([f"{t['lists']}: {_discord_plain(data.lists)}"] if data.lists else []),
             f"{t['inbox']}: {inbox}",
             footer,
         ])
@@ -372,6 +397,9 @@ def render_discord(data: BriefData, language: str, mode: str, full_path: str,
     lines += ["", f"**{t['quota']}**", _discord_plain(data.quota)]
     if data.mail:
         lines += ["", f"**{t['mail']}**", _discord_plain(data.mail)]
+    if data.lists:
+        lines += ["", f"**{t['lists']}**", _discord_plain(data.lists)]
+        lines += [f"- {discord_line(line, 300)}" for line in data.list_lines]
     lines += ["", f"**{t['inbox']}**"]
     lines.append(t["captures"].format(n=data.captures, since=data.since_text) if data.has_vault else t["no_vault"])
     lines.append(footer)
@@ -408,6 +436,7 @@ def render_plain(data: BriefData, language: str, mode: str, full_path: str, poli
             f"{t['sessions']}: {_counts_text(data) or t['no_status']}",
             f"{t['quota']}: {_plain(data.quota)}",
             *([f"{t['mail']}: {_plain(data.mail)}"] if data.mail else []),
+            *([f"{t['lists']}: {_plain(data.lists)}"] if data.lists else []),
             f"{t['inbox']}: {inbox}",
             footer,
         ])
@@ -434,6 +463,9 @@ def render_plain(data: BriefData, language: str, mode: str, full_path: str, poli
     lines += ["", t["quota"], _plain(data.quota)]
     if data.mail:
         lines += ["", t["mail"], _plain(data.mail)]
+    if data.lists:
+        lines += ["", t["lists"], _plain(data.lists)]
+        lines += [f"- {inert(line, 300)}" for line in data.list_lines]
     lines += ["", t["inbox"]]
     lines.append(t["captures"].format(n=data.captures, since=data.since_text) if data.has_vault else t["no_vault"])
     lines.append(footer)
@@ -852,6 +884,9 @@ def _run_locked(config: "Config", now: datetime, send: bool, polish: bool, by: s
     summary = mail_summary(config, ts)
     if summary:
         data = dataclasses.replace(data, mail=summary)
+    lists, list_lines = focus_summary(config, ts)
+    if lists:
+        data = dataclasses.replace(data, lists=lists, list_lines=list_lines)
     text = render_markdown(data, config.language)
     name = f"brief-{today}.md"
     written = _write_output(vault, name, text, note)

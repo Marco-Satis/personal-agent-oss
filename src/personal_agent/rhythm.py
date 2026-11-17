@@ -144,6 +144,22 @@ def weekly_lines(snap: Snapshot, week_start: float, language: str = "en") -> lis
     return lines
 
 
+def focus_evening_lines(config: "Config", now: float) -> list[str]:
+    """The evening part of the focus lists (done today, still open, how to review); never creates the db."""
+    if "focus" not in getattr(config, "modules", ()):
+        return []
+    try:
+        from .focus import DB_FILE, OWNER_ID, FocusService, FocusStore, Person
+
+        if not (Path(config.state_dir) / DB_FILE).is_file():
+            return []
+        return FocusService(FocusStore(config.state_dir, clock=lambda: now), Person(OWNER_ID),
+                            config.language).evening_lines()
+    except Exception as exc:  # noqa: BLE001 - an update never fails because of the lists
+        log.warning("rhythm: focus lists unreadable (%s)", type(exc).__name__)
+        return []
+
+
 class RhythmScheduler:
     """Ticks every 30 s next to the brief scheduler; sends each due slot once."""
 
@@ -232,6 +248,8 @@ class RhythmScheduler:
                 since = self._last_message_at(state, today)
                 title = f"{t[slot]} {datetime.fromtimestamp(at).strftime('%H:%M')}"
                 lines = update_lines(snap, since, datetime.fromtimestamp(since).strftime("%H:%M"), language)
+                if slot == "evening":
+                    lines += focus_evening_lines(self.config, now)
             # Marked before sending: a crash mid-send must not repeat the message on restart.
             self._mark(state, slot, key, now)
             try:
