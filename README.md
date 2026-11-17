@@ -233,6 +233,8 @@ fokus Angebot schreiben       # add to your focus list; a fourth open item goes 
 fokus gemeinsam Steuer        # add to the shared list
 fokus #12 [gemeinsam]         # move item 12 (e.g. from the inbox) to a focus list; refused when it is full
 erledigt 12 · verwerfen 12    # done / dropped; nothing is ever deleted
+matrix 12 sofort|planen|abgeben|streichen   # Eisenhower: do, plan, hand over, drop
+rückblick [<highlight>] · guter tag sport paar …   # evening review: 1-2 highlights, what made a good day
 inbox|später|einkauf|freude [privat] [<text>]   # show a list, or add to it
 ```
 

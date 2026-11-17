@@ -404,6 +404,26 @@ class FocusStore:
             conn.close()
         return [_item(row) for row in rows]
 
+    def set_matrix(self, person: Person, item_id: int, urgent: bool, important: bool) -> Item:
+        """Place an open item in the Eisenhower matrix (urgent/important), with the edit rights."""
+        def apply(conn: sqlite3.Connection, item: Item) -> None:
+            if item.status != "open":
+                raise FocusError(f"#{item_id} is already {item.status}")
+            conn.execute("UPDATE items SET urgent = ?, important = ? WHERE id = ?",
+                         (int(urgent), int(important), item_id))
+        return self._change(person, item_id, apply)
+
+    def matrix_of(self, item_id: int) -> tuple[bool, bool] | None:
+        """(urgent, important) of an item, None when it was never placed."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT urgent, important FROM items WHERE id = ?", (item_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return bool(row[0]), bool(row[1])
+
     def owner_of(self, person: Person, item_id: int) -> str | None:
         """The owner of an item the person may see, or None (missing or private to someone else)."""
         conn = self._connect()
@@ -466,6 +486,15 @@ GOOD_DAY_WORDS = {  # German and English words for the good-day points
     "basics": "basics", "paar": "couple", "couple": "couple", "allein": "alone", "alone": "alone",
     "sport": "sport", "balance": "balance", "beruf": "work", "arbeit": "work", "work": "work",
 }
+# Eisenhower: do (urgent+important), plan (important), hand over (urgent), drop (neither)
+MATRIX_WORDS = ("matrix", "eisenhower")
+QUADRANTS = {
+    "sofort": (True, True), "do": (True, True),
+    "planen": (False, True), "plan": (False, True),
+    "abgeben": (True, False), "delegate": (True, False),
+    "streichen": (False, False), "delete": (False, False),
+}
+QUADRANT_KEYS = {(True, True): "q_do", (False, True): "q_plan", (True, False): "q_delegate", (False, False): "q_drop"}
 DONE_WORDS = ("erledigt", "done")
 DROP_WORDS = ("verwerfen", "drop")
 SHARED_WORDS = ("gemeinsam", "shared")
@@ -491,6 +520,11 @@ def parse_focus_command(text: str) -> FocusCommand | None:
         if not points or "?" in points:
             return FocusCommand("good_usage")
         return FocusCommand("good_day", arg=" ".join(points))
+    if word in MATRIX_WORDS:
+        match = re.fullmatch(r"#?(\d{1,9})\s+(\w+)", rest)
+        if not match or match.group(2).lower() not in QUADRANTS:
+            return FocusCommand("matrix_usage")
+        return FocusCommand("matrix", arg=match.group(2).lower(), item_id=int(match.group(1)))
     if word in DONE_WORDS or word in DROP_WORDS:
         match = _ID.fullmatch(rest)
         if not match:
@@ -570,8 +604,11 @@ TEXTS = {
         "brief_counts": "your focus {own}/{max} open · shared {shared} · inbox {inbox} · shopping {shopping}",
         "evening_done": "Done today: {n}", "evening_open": "Still open in your focus: {items}",
         "evening_hint": "Review: rückblick <highlight> (1-2) · guter tag sport paar … · "
-                        "move open items: später #<n> or fokus #<n>",
+                        "open items: matrix <n> sofort|planen|abgeben|streichen, später #<n>",
         "joy_today": "Joy island: {text}",
+        "matrix_usage": "usage: matrix <n> sofort|planen|abgeben|streichen (Eisenhower)",
+        "matrix_set": "#{id}: {quadrant}",
+        "q_do": "do now", "q_plan": "plan", "q_delegate": "hand over", "q_drop": "drop",
     },
     "de": {
         "focus": "Fokus", "inbox": "Inbox", "later": "Später", "shopping": "Einkaufsliste", "joy": "Freudeinsel",
@@ -590,8 +627,11 @@ TEXTS = {
         "brief_counts": "dein Fokus {own}/{max} offen · gemeinsam {shared} · Inbox {inbox} · Einkauf {shopping}",
         "evening_done": "Heute erledigt: {n}", "evening_open": "Noch offen in deinem Fokus: {items}",
         "evening_hint": "Rückblick: rückblick <Highlight> (1–2) · guter tag sport paar … · "
-                        "Offenes verschieben: später #<n> oder fokus #<n>",
+                        "Offenes einplanen: matrix <n> sofort|planen|abgeben|streichen, später #<n>",
         "joy_today": "Freudeinsel: {text}",
+        "matrix_usage": "So geht es: matrix <n> sofort|planen|abgeben|streichen (Eisenhower)",
+        "matrix_set": "#{id}: {quadrant}",
+        "q_do": "sofort", "q_plan": "planen", "q_delegate": "abgeben", "q_drop": "streichen",
     },
 }
 
@@ -636,6 +676,12 @@ class FocusService:
             return t["usage"]
         if cmd.kind == "good_usage":
             return t["good_usage"]
+        if cmd.kind == "matrix_usage":
+            return t["matrix_usage"]
+        if cmd.kind == "matrix":
+            urgent, important = QUADRANTS[cmd.arg]
+            item = store.set_matrix(person, cmd.item_id, urgent, important)
+            return t["matrix_set"].format(id=item.id, quadrant=t[QUADRANT_KEYS[(urgent, important)]])
         if cmd.kind == "review":
             highlights, _ = store.add_highlight(person, cmd.arg)
             return t["highlight_added"].format(n=len(highlights), max=MAX_HIGHLIGHTS)
@@ -704,7 +750,11 @@ class FocusService:
         lines = [t["evening_done"].format(n=len(done)) + (": " + "; ".join(i.text for i in done[:5]) if done else "")]
         still = store.items(person, "focus", owner=person.id)
         if still:
-            lines.append(t["evening_open"].format(items="; ".join(f"#{i.id} {i.text}" for i in still)))
+            order = ["q_do", "q_plan", "q_delegate", "q_drop"]
+            placed = [(store.matrix_of(i.id), i) for i in still]
+            placed.sort(key=lambda pair: order.index(QUADRANT_KEYS[pair[0]]) if pair[0] else len(order))
+            shown = [f"#{i.id} {i.text}" + (f" ({t[QUADRANT_KEYS[m]]})" if m else "") for m, i in placed]
+            lines.append(t["evening_open"].format(items="; ".join(shown)))
         lines.append(t["evening_hint"])
         return lines
 

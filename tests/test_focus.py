@@ -359,3 +359,41 @@ def test_brief_and_evening_read_the_lists_without_creating_them(tmp_path):
     assert focus_evening_lines(config, T0 + 60)[0] == "Heute erledigt: 1: Angebot <b>"
     off = Config(state_dir=tmp_path, status_dir=tmp_path / "s", modules=("brief",))
     assert focus_summary(off, T0) == ("", ()) and focus_evening_lines(off, T0) == []
+
+
+# --- F2b: Eisenhower matrix for open items ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("matrix 3 sofort", FocusCommand("matrix", arg="sofort", item_id=3)),
+    ("matrix #3 planen", FocusCommand("matrix", arg="planen", item_id=3)),
+    ("eisenhower 3 delegate", FocusCommand("matrix", arg="delegate", item_id=3)),
+    ("matrix 3", FocusCommand("matrix_usage")),
+    ("matrix 3 bald", FocusCommand("matrix_usage")),
+])
+def test_parse_matrix(text, expected):
+    assert parse_focus_command(text) == expected
+
+
+def test_matrix_places_items_and_orders_the_evening(store):
+    svc = FocusService(store, A, "de")
+    for text in ("fokus Steuer", "fokus Angebot", "fokus Ablage"):
+        svc.command(parse_focus_command(text))
+    assert svc.command(parse_focus_command("matrix 2 sofort")) == ("#2: sofort", False)
+    assert svc.command(parse_focus_command("matrix 3 abgeben")) == ("#3: abgeben", False)
+    assert store.matrix_of(2) == (True, True) and store.matrix_of(1) is None
+    evening = svc.evening_lines()[1]
+    assert evening == "Noch offen in deinem Fokus: #2 Angebot (sofort); #3 Ablage (abgeben); #1 Steuer"
+    svc.command(parse_focus_command("erledigt 2"))
+    text, err = svc.command(parse_focus_command("matrix 2 planen"))
+    assert err and "already done" in text
+    assert svc.command(parse_focus_command("matrix 9 planen"))[1]  # unknown item
+
+
+def test_matrix_follows_the_edit_rights(store):
+    item, _ = store.add(A, "anna's", "focus")
+    with pytest.raises(FocusError, match="role"):
+        store.set_matrix(EMP, item.id, True, True)
+    secret, _ = store.add(A, "secret", "inbox", private=True)
+    with pytest.raises(FocusError, match=f"no item #{secret.id}"):
+        store.set_matrix(B, secret.id, True, True)
