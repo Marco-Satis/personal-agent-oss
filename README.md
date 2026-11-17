@@ -507,6 +507,37 @@ is denied with a hint to use the chat or the approval page. PIN-like text and me
 10 minutes are not handled. It needs `PA_NTFY_TOKEN`, and the topic must be writable only by the
 agent's user and yours (`deny-all` otherwise): whoever can write to it is treated as you.
 
+### Phone shortcuts (Siri, tailnet only)
+
+A thin client for the phone: an iOS Shortcut (or an Android automation) dictates your message, posts it
+to the agent and reads the answer aloud. Nothing runs on the phone; the assistant runs here, with the
+same commands, focus lists and rules as the chat. Off by default.
+
+```
+personal-agent devices add iphone        # prints a device token once: put it into the shortcut
+PA_CHAT_DEVICES=on                       # then restart serve
+tailscale serve --bg 8787                # reach serve from your tailnet over HTTPS
+personal-agent devices list | revoke iphone
+```
+
+`POST /chat` with `Authorization: Bearer <device token>` and `{"text": "…"}` answers
+`{"reply": "…"}`; a reply that takes longer than 25 s comes back as `202 {"id": …}`, fetch it with
+`GET /chat/<id>?wait=25`. Three locks:
+
+1. **Tailnet only.** `/chat` answers 404 unless the request comes through `tailscale serve`, which adds
+   the `Tailscale-User-Login` header for tailnet traffic and never for Funnel (public) traffic. Do not
+   put `/chat` behind Funnel. `/escalate` and `/internal/` stay local-only (they refuse requests that
+   carry Tailscale or forwarding headers).
+2. **A token per phone**, stored only as a hash in `state_dir/devices.json`; revoke a lost phone at once.
+   The token is plain text inside the shortcut: add it as an import question, so sharing the shortcut
+   does not share the token.
+3. **Chat only.** Approvals never happen over the shortcut: a level-2/3 request is denied and the reply
+   says where to approve. Your own focus lists work without an approval. Text that looks like a PIN is
+   never handled; at most 10 messages a minute per phone, model turns share the hourly cap
+   (`PA_TELEGRAM_MAX_TURNS_PER_HOUR`).
+
+Step-by-step shortcut: [docs/PHONE-SHORTCUT.md](docs/PHONE-SHORTCUT.md).
+
 ### Telegram
 
 A Telegram bot brings the agent to your phone: notices, approvals with buttons, and a chat with the same

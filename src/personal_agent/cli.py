@@ -595,6 +595,39 @@ def _cmd_audit(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_devices(config: Config, args: argparse.Namespace) -> int:
+    """Device tokens for phone shortcuts (POST /chat, PA_CHAT_DEVICES=on)."""
+    import datetime as _dt
+
+    from .devchat import DeviceError, DeviceStore
+
+    store = DeviceStore(config.state_dir)
+    if args.devices_command == "add":
+        try:
+            token = store.add(args.name)
+        except (DeviceError, OSError) as exc:
+            print(f"devices: {exc}", file=sys.stderr)
+            return 1
+        print(f"device {args.name} added. Its token, shown only now (put it into the shortcut, not into a chat):")
+        print(token)
+        if not config.chat_devices:
+            print("note: PA_CHAT_DEVICES is off; /chat answers 404 until you switch it on and restart serve")
+        return 0
+    if args.devices_command == "revoke":
+        if store.revoke(args.name):
+            print(f"device {args.name} revoked; its token no longer works")
+            return 0
+        print(f"no active device {args.name}", file=sys.stderr)
+        return 1
+    devices = store.list()
+    if not devices:
+        print("no devices")
+    for name, active, created in devices:
+        when = _dt.datetime.fromtimestamp(created).strftime("%Y-%m-%d") if created else "-"
+        print(f"{name:<32} {'active ' if active else 'revoked'} since {when}")
+    return 0
+
+
 def _cmd_backup(config: Config, args: argparse.Namespace) -> int:
     """Pack, list or check backups of the state directory and the vault (never restores)."""
     from .backup import BackupError, backup_dir, create_backup, extract_backup, list_backups, verify_backup
@@ -781,6 +814,14 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("target", type=Path, help="new or empty folder")
     extract.add_argument("path", nargs="?", help="archive (default: the newest)")
 
+    devices = sub.add_parser("devices", help="device tokens for phone shortcuts (POST /chat, tailnet only)")
+    devices_sub = devices.add_subparsers(dest="devices_command", required=True)
+    devices_add = devices_sub.add_parser("add", help="create a token for a phone; shown once")
+    devices_add.add_argument("name", help="lowercase letters, digits and dashes, e.g. iphone")
+    devices_sub.add_parser("list", help="list the devices (never a token)")
+    devices_revoke = devices_sub.add_parser("revoke", help="revoke a device token at once")
+    devices_revoke.add_argument("name")
+
     mail = sub.add_parser("mail", help="the read-only mail reader (PA_MAIL_CONFIG)")
     mail_sub = mail.add_subparsers(dest="mail_command", required=True)
     mail_check = mail_sub.add_parser("check", help="check the mail config (names only; --connect logs in)")
@@ -805,6 +846,7 @@ COMMANDS = {
     "mail": _cmd_mail,
     "backup": _cmd_backup,
     "audit": _cmd_audit,
+    "devices": _cmd_devices,
 }
 
 

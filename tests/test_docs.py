@@ -39,10 +39,11 @@ def test_cli_has_no_command_that_sends_to_a_session():
     commands = _subcommands(build_parser())
     assert set(commands) == set(COMMANDS) == {
         "serve", "escalate", "status", "simulate", "chat", "vault", "plugins", "brief", "hooks", "telegram", "safety",
-        "modules", "mail", "backup", "audit"}
+        "modules", "mail", "backup", "audit", "devices"}
     assert set(_subcommands(commands["telegram"])) == {"pair", "status", "unpair"}
     assert set(_subcommands(commands["backup"])) == {"create", "list", "verify", "extract"}  # extract: empty folder only
     assert set(_subcommands(commands["hooks"])) == {"snippet"}
+    assert set(_subcommands(commands["devices"])) == {"add", "list", "revoke"}
     assert set(_subcommands(commands["mail"])) == {"check"}  # read-only: nothing that sends mail
 
 

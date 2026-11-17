@@ -9,6 +9,8 @@ Endpoints:
   POST /internal/approvals                local, bearer: register a remote approval
   GET  /internal/approvals/<id>?wait=N    local, bearer: state of an approval (long poll)
   POST /internal/approvals/<id>/cancel    local, bearer: the agent stopped waiting
+  POST /chat                              tailnet only, `Authorization: Bearer <device token>` (devchat.py)
+  GET  /chat/<id>?wait=N                  the same: pick up a reply that took longer
   GET  /healthz                           liveness
 
 Bind to 127.0.0.1 and put a reverse proxy or tunnel in front that forwards only
@@ -44,6 +46,7 @@ from typing import TYPE_CHECKING
 
 from .config import Config
 from .conversation import Call, CallRegistry
+from .devchat import WAIT_S
 from .escalation import EscalationPolicy, Event
 from .approval import CONFIRM_WORD
 from .notify import Notifier, alert_notice, alert_outcome, resolve_route
@@ -53,6 +56,7 @@ from .telephony import CallProvider, FakeProvider, TwilioProvider, render_twiml,
 
 if TYPE_CHECKING:
     from .brief import BriefScheduler
+    from .devchat import DeviceChat
     from .telegram_bot import TelegramService
 
 log = logging.getLogger(__name__)
@@ -62,6 +66,8 @@ HANGUP_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Respo
 FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip")
 APPROVE_PREFIX = "/approve/"
 INTERNAL_PREFIX = "/internal/approvals"
+CHAT_PATH = "/chat"
+TAILNET_IDENTITY = "tailscale-user-login"  # set by tailscale serve for tailnet traffic, never for Funnel
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
     "X-Frame-Options": "DENY",
@@ -88,6 +94,7 @@ class Agent:
         self.config = config
         self.notifier = notifier
         self.telegram = telegram
+        self.device_chat: "DeviceChat | None" = None  # serve starts it with PA_CHAT_DEVICES=on
         if approvals is None and config.remote_approvals:
             approvals = ApprovalInbox(
                 DiscordWebhook(config.discord_webhook) if config.discord_webhook else None,
@@ -202,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
             path = APPROVE_PREFIX + "…"  # the one-time id is a capability
         elif path.startswith(INTERNAL_PREFIX + "/"):
             path = INTERNAL_PREFIX + "/…" + ("/cancel" if path.endswith("/cancel") else "")
+        elif path.startswith(CHAT_PATH + "/"):
+            path = CHAT_PATH + "/…"
         log.debug("%s %s", self.command, path)
 
     def _send(self, code: int, body: str, content_type: str, headers: dict[str, str] | None = None) -> None:
@@ -268,6 +277,8 @@ class Handler(BaseHTTPRequestHandler):
             self._approve_page(path[len(APPROVE_PREFIX):])
         elif path.startswith(INTERNAL_PREFIX + "/"):
             self._internal_state(path[len(INTERNAL_PREFIX) + 1:], parts.query)
+        elif path.startswith(CHAT_PATH + "/"):
+            self._chat_result(path[len(CHAT_PATH) + 1:], parts.query)
         else:
             self._json(404, {"error": "not found"})
 
@@ -279,6 +290,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/escalate":
             self._escalate(body)
+        elif path == CHAT_PATH:
+            self._chat_post(body)
         elif path in ("/twilio/voice", "/twilio/gather"):
             self._twilio(path, body)
         elif path.startswith(APPROVE_PREFIX):
@@ -303,6 +316,58 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(exc)})
             return
         self._json(200, self.agent.escalate(event))
+
+    # --- device chat (phone shortcuts), tailnet only ---
+
+    def _chat_device(self) -> str | None:
+        """The device name of an allowed /chat request, or None after an answer was sent.
+
+        Off, not from loopback, or without the tailnet identity header (Funnel or a direct
+        public request): 404. Then the device token decides (401).
+        """
+        chat = self.agent.device_chat
+        try:
+            loopback = ipaddress.ip_address(str(self.client_address[0]).split("%", 1)[0]).is_loopback
+        except (ValueError, IndexError):
+            loopback = False
+        if chat is None or not loopback or not self.headers.get(TAILNET_IDENTITY, "").strip():
+            self._json(404, {"error": "not found"})
+            return None
+        auth = self.headers.get("Authorization", "")
+        device = chat.devices.verify(auth[len("Bearer "):]) if auth.startswith("Bearer ") else None
+        if device is None:
+            self._json(401, {"error": "unauthorized"})
+            return None
+        return device
+
+    def _chat_post(self, body: bytes) -> None:
+        device = self._chat_device()
+        if device is None:
+            return
+        try:
+            data = json.loads(body.decode() or "{}")
+        except (ValueError, UnicodeDecodeError):
+            self._json(400, {"error": "invalid JSON"})
+            return
+        if not isinstance(data, dict):
+            self._json(400, {"error": "invalid JSON"})
+            return
+        chat = self.agent.device_chat
+        code, payload = chat.submit(device, data.get("text"))
+        if code == 202:
+            code, payload = chat.result(device, payload["id"], WAIT_S)
+        self._json(code, payload)
+
+    def _chat_result(self, job_id: str, query: str) -> None:
+        device = self._chat_device()
+        if device is None:
+            return
+        try:
+            wait = float(urllib.parse.parse_qs(query).get("wait", ["0"])[0])
+        except ValueError:
+            wait = 0.0
+        code, payload = self.agent.device_chat.result(device, job_id, wait)
+        self._json(code, payload)
 
     # --- remote approvals: local API for the chat process ---
 
@@ -575,6 +640,9 @@ def serve(config: Config) -> None:
     from .ntfy_inbox import start_ntfy_inbox
 
     ntfy_inbox = start_ntfy_inbox(config)
+    from .devchat import start_device_chat
+
+    agent.device_chat = start_device_chat(config)
 
     def on_sigterm(_signum: int, _frame: object) -> None:
         # serve_forever runs in this (main) thread: shutdown() must come from another one.
@@ -594,6 +662,8 @@ def serve(config: Config) -> None:
             telegram.close(join_s=8.0)
         if ntfy_inbox is not None:
             ntfy_inbox.close(join_s=5.0)
+        if agent.device_chat is not None:
+            agent.device_chat.close(join_s=5.0)
         notifier.close(5.0)
         server.server_close()
         if previous is not None:

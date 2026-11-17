@@ -510,7 +510,7 @@ class Router:
         self.time_awareness = time_awareness  # None: no time note (tests, PA_TIME_NOTE=off)
         # Trusted: "telegram" (or "ntfy") for serve's remote assistants. Mail output follows PA_MAIL_TELEGRAM
         # there: every channel that leaves this machine gets the same mail rules.
-        self.channel = "telegram" if channel in ("telegram", "ntfy") else "console"
+        self.channel = "telegram" if channel in ("telegram", "ntfy", "device") else "console"
         self.mail = mail  # None: PA_MAIL_CONFIG is not set
         self.note_source = note_source  # trusted: "telegram" marks notes captured over Telegram
         self.small = small if config.small_model else None

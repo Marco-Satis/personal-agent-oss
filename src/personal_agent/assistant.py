@@ -57,7 +57,7 @@ CHAT_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "Skill")
 STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json",
                  "tasks.json", "tasks.lock", "tasks-owner.lock", "telegram-owner.json", "telegram-pairing.json",
                  "telegram-offset.json", "telegram.lock", "safety-stop.json", "approval-pinlock.json",
-                 "mail-cache.json", "mail.lock", "focus.db", "focus.db-journal")
+                 "mail-cache.json", "mail.lock", "focus.db", "focus.db-journal", "devices.json")
 DELEGATION_PROMPT = """
 You can queue background work with the tool mcp__pa__delegate_task (text up to 300 characters,
 optional domain). Use it only when the person asks for background work. The person must approve
