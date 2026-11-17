@@ -317,6 +317,18 @@ class FocusStore:
         finally:
             conn.close()
 
+    def owner_of(self, person: Person, item_id: int) -> str | None:
+        """The owner of an item the person may see, or None (missing or private to someone else)."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        item = _item(row)
+        return item.owner if self._may_see(person, item) else None
+
     def focus_owners(self, person: Person) -> list[str]:
         """Owners with visible open or recent focus items: the person first, then shared, then others."""
         conn = self._connect()
@@ -397,6 +409,40 @@ def parse_focus_command(text: str) -> FocusCommand | None:
     return FocusCommand("add", list_name, rest, shared=shared, private=private)
 
 
+TOOL_KEYS = frozenset({"op", "list", "text", "item_id", "shared", "private"})
+AGENT_SOURCE = "agent"
+
+
+def tool_command(tool_input: object) -> tuple[FocusCommand | None, str | None]:
+    """(command, problem) for an input of the assistant's focus tool. Checked again on every call."""
+    if not isinstance(tool_input, dict) or not set(tool_input) <= TOOL_KEYS:
+        return None, "invalid focus request"
+    op = tool_input.get("op")
+    list_name = tool_input.get("list", "")
+    text = tool_input.get("text", "")
+    item_id = tool_input.get("item_id", 0)
+    shared = tool_input.get("shared", False)
+    private = tool_input.get("private", False)
+    if not isinstance(shared, bool) or not isinstance(private, bool) or not isinstance(text, str) \
+            or not isinstance(list_name, str) or isinstance(item_id, bool) or not isinstance(item_id, int):
+        return None, "invalid focus request"
+    if list_name and list_name not in LISTS:
+        return None, "unknown list"
+    if op == "show":
+        return FocusCommand("show", list_name or "focus"), None
+    if op == "add":
+        if not list_name or not text.strip() or len(text) > MAX_TEXT or (shared and private):
+            return None, f"add needs list and 1 to {MAX_TEXT} characters of text, not shared and private at once"
+        return FocusCommand("add", list_name, text, shared=shared, private=private), None
+    if op in ("move", "done", "drop"):
+        if item_id < 1:
+            return None, f"{op} needs item_id"
+        if op == "move" and not list_name:
+            return None, "move needs list"
+        return FocusCommand(op, list_name if op == "move" else "", shared=shared, item_id=item_id), None
+    return None, "unknown op"
+
+
 TEXTS = {
     "en": {
         "focus": "Focus", "inbox": "Inbox", "later": "Later", "shopping": "Shopping list", "joy": "Joy island",
@@ -429,15 +475,29 @@ class FocusService:
         return ("Focus lists (at most 3 open per person and shared), inbox, later, shopping list, joy island: "
                 + self.t["usage"])
 
-    def command(self, cmd: FocusCommand) -> tuple[str, bool]:
+    def own_change(self, cmd: FocusCommand) -> bool:
+        """Whether the command only reads or touches the person's own or the shared lists.
+
+        Those changes the assistant may make without asking (Marco 17.11.2026); a change to
+        another person's list needs the person's approval. Unknown or invisible items count
+        as not own, so the asking path gives the usual "no item" answer.
+        """
+        if cmd.kind in ("show", "usage"):
+            return True
+        if cmd.kind == "add":
+            return True  # add never names another owner
+        owner = self.store.owner_of(self.person, cmd.item_id)
+        return owner in (self.person.id, SHARED)
+
+    def command(self, cmd: FocusCommand, source: str | None = None) -> tuple[str, bool]:
         try:
-            return self._run(cmd), False
+            return self._run(cmd, source), False
         except FocusError as exc:
             return str(exc), True
         except (OSError, sqlite3.Error) as exc:
             return f"focus unavailable: {type(exc).__name__}", True
 
-    def _run(self, cmd: FocusCommand) -> str:
+    def _run(self, cmd: FocusCommand, source: str | None = None) -> str:
         t, store, person = self.t, self.store, self.person
         if cmd.kind == "usage":
             return t["usage"]
@@ -452,7 +512,7 @@ class FocusService:
             return t["moved"].format(id=item.id, list=t[item.list])
         if cmd.kind == "add":
             owner = SHARED if cmd.shared else None
-            item, landed = store.add(person, cmd.arg, cmd.list, owner=owner, private=cmd.private)
+            item, landed = store.add(person, cmd.arg, cmd.list, owner=owner, private=cmd.private, source=source)
             if landed != cmd.list:
                 return t["full"].format(max=MAX_FOCUS, id=item.id)
             return t["added"].format(id=item.id, list=t[landed])
@@ -489,5 +549,5 @@ class FocusService:
 
 __all__ = [
     "DB_FILE", "MAX_FOCUS", "OWNER_ID", "SHARED", "FocusCommand", "FocusError", "FocusService", "FocusStore", "Item",
-    "Person", "parse_focus_command",
+    "Person", "parse_focus_command", "tool_command",
 ]

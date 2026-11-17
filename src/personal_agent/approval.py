@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, Protocol
 from . import approval_server
 from .approval_server import (
     ENV_DELEGATE,
+    ENV_FOCUS,
     ENV_SOCKET,
     ENV_TIMEOUT,
     ENV_TOKEN,
@@ -66,7 +67,7 @@ from .approval_server import (
     input_digest,
 )
 from .audit import record_approval
-from .bridge import DELEGATE_TOOL
+from .bridge import DELEGATE_TOOL, FOCUS_TOOL
 from .status import clean_text
 from .textsafe import strip_invisible
 from .timeaware import record_event
@@ -74,6 +75,7 @@ from .vault import TASK_ID_RE, Vault, valid_domain
 
 if TYPE_CHECKING:
     from .console import ChatConsole
+    from .focus import FocusService
 
 try:
     import termios
@@ -205,6 +207,9 @@ def classify(tool_name: object, tool_input: object, workdir: Path | None = None)
         return Level.DANGER
     if not TOOL_NAME_RE.fullmatch(tool_name):
         return Level.DANGER
+    if tool_name == FOCUS_TOOL:
+        # Our own tool for the focus lists; the broker decides per call (see _decide_focus).
+        return Level.WRITE
     if tool_name == DELEGATE_TOOL:
         # Our own tool; it only queues a task. The broker raises it to level 3 when the
         # turn carries note or skill context (see _decide_delegate).
@@ -620,7 +625,8 @@ class ConsoleChannel:
 # --- files and MCP configuration -----------------------------------------------
 
 
-def build_mcp_config(socket_path: Path, token: str, timeout_s: int, delegate: bool = False) -> dict:
+def build_mcp_config(socket_path: Path, token: str, timeout_s: int, delegate: bool = False,
+                     focus: bool = False) -> dict:
     """MCP config for Claude Code. The child runs isolated from an absolute path.
 
     -I ignores PYTHON* variables, the cwd and the user site; -S also skips the `site`
@@ -630,6 +636,8 @@ def build_mcp_config(socket_path: Path, token: str, timeout_s: int, delegate: bo
     env = {ENV_SOCKET: str(socket_path), ENV_TOKEN: token, ENV_TIMEOUT: str(int(timeout_s))}
     if delegate:
         env[ENV_DELEGATE] = "1"
+    if focus:
+        env[ENV_FOCUS] = "1"
     return {
         "mcpServers": {
             SERVER_NAME: {
@@ -734,6 +742,8 @@ class _Handler(socketserver.StreamRequestHandler):
         op = frame.get("op", "approve")
         if op == "delegate":
             return broker.delegate(scope, frame)
+        if op == "focus":
+            return broker.focus(scope, frame)
         if op != "approve":
             return Verdict(False, "invalid request")
         tool_name = frame.get("tool_name")
@@ -792,6 +802,7 @@ class ApprovalScope:
     _prompts_shown: int = field(default=0, repr=False)
     _approved_delegations: list = field(default_factory=list, repr=False)
     _delegations: int = field(default=0, repr=False)
+    _approved_focus: list = field(default_factory=list, repr=False)
 
     def begin_turn(self) -> None:
         assert self.broker is not None
@@ -887,6 +898,7 @@ class ApprovalBroker:
         self.bind_wait_s = bind_wait_s
         self.closing = threading.Event()
         self.on_delegate: Callable[[str, str | None], str] | None = None  # TaskService.delegate
+        self.focus_service: "FocusService | None" = None  # set by enable_focus (module "focus")
         self.events_dir: Path | None = None  # state dir for timeaware events (helper approvals)
         self.audit_dir: Path | None = None  # state dir for the audit log (audit.py)
         self._cond = threading.Condition()
@@ -943,10 +955,20 @@ class ApprovalBroker:
         if self._server is not None and self._dir is not None:
             self._write_main_config()
 
+    def enable_focus(self, service: "FocusService") -> None:
+        """Offer the focus tool to the main session (all channels: it acts for the person only).
+
+        Call before the main session starts; afterwards the MCP config is rewritten.
+        """
+        self.focus_service = service
+        if self._server is not None and self._dir is not None:
+            self._write_main_config()
+
     def _write_main_config(self) -> None:
         """Write (or atomically replace) mcp.json for the main scope."""
         assert self._dir is not None
-        config = build_mcp_config(self._dir / "s", self._main.token, self.timeout_s, delegate=self._main.delegation)
+        config = build_mcp_config(self._dir / "s", self._main.token, self.timeout_s, delegate=self._main.delegation,
+                                  focus=self.focus_service is not None)
         target = self._dir / "mcp.json"
         if not target.exists():
             write_private(target, json.dumps(config))
@@ -983,6 +1005,7 @@ class ApprovalBroker:
             scope._refusals = 0
             scope._turn_context = None
             scope._approved_delegations.clear()
+            scope._approved_focus.clear()
             scope._delegations = 0
             scope.turn_active.set()
             self._cond.notify_all()
@@ -992,6 +1015,7 @@ class ApprovalBroker:
             scope.turn_active.clear()
             scope._tool_uses.clear()
             scope._approved_delegations.clear()
+            scope._approved_focus.clear()
             scope._delegations = 0
             self._cond.notify_all()
 
@@ -1285,6 +1309,8 @@ class ApprovalBroker:
             return Verdict(False, reason), None, rid
         if tool_name == DELEGATE_TOOL:
             return self._decide_delegate(scope, announced, tool_use_id, deadline, rid)
+        if tool_name == FOCUS_TOOL:
+            return self._decide_focus(scope, announced, tool_use_id, deadline, rid)
         append_summary = None
         if tool_name in WRITE_TOOLS:
             if scope.kind != "main":
@@ -1469,6 +1495,74 @@ class ApprovalBroker:
         if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
             return Verdict(False, "delegation failed")
         return Verdict(True, "queued", task_id=task_id)
+
+    # --- focus lists (main session only) ---
+
+    def _decide_focus(self, scope: ApprovalScope, announced: dict, tool_use_id: str | None,
+                      deadline: float, rid: str) -> tuple[Verdict, Level | None, str]:
+        """The permission request for the focus tool (Marco 17.11.2026: the assistant adds and
+        removes items like the person does).
+
+        Reading and changes to the person's own or the shared lists run without a prompt; a
+        change to another person's list, or any change in a turn that carries note or skill
+        context (possibly injected text), asks the person first. Everything is reversible
+        (drop, never delete) and goes to the audit log.
+        """
+        from .focus import tool_command
+
+        service = self.focus_service
+        if scope.kind != "main" or service is None:
+            return Verdict(False, "focus lists are off"), None, rid
+        command, problem = tool_command(announced)
+        if command is None:
+            return Verdict(False, problem or "invalid focus request"), None, rid
+        with self._cond:
+            context = scope._turn_context
+        try:
+            own = service.own_change(command)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store means: ask
+            log.warning("focus owner check failed: %s", type(exc).__name__)
+            own = False
+        if command.kind == "show":
+            verdict, level = Verdict(True, "reading the lists"), Level.READ
+        elif own and not context:
+            verdict, level = Verdict(True, "own or shared list, no prompt needed"), Level.WRITE
+        else:
+            summary = f"change the focus lists: {json.dumps(announced, ensure_ascii=True, sort_keys=True)}"
+            level = Level.WRITE
+            request = self._request(scope, FOCUS_TOOL, level, summary, tool_use_id, None)
+            verdict = self._ask(scope, request, deadline)
+            rid = request.request_id
+        if verdict.allow:
+            with self._cond:
+                if not scope.turn_active.is_set():
+                    return Verdict(False, "no active turn"), level, rid
+                scope._approved_focus.append(input_digest(announced))
+        return verdict, level, rid
+
+    def focus(self, scope: ApprovalScope, frame: dict) -> Verdict:
+        """The focus tool call itself: only with a one-shot approval of exactly this input."""
+        from .focus import AGENT_SOURCE, tool_command
+
+        tool_input, sha = frame.get("input"), frame.get("input_sha256")
+        service = self.focus_service
+        if not isinstance(tool_input, dict) or not isinstance(sha, str):
+            return Verdict(False, "invalid request")
+        if scope.kind != "main" or service is None:
+            return Verdict(False, "focus lists are off")
+        if self.closing.is_set() or not self._live(scope):
+            return Verdict(False, "no active turn")
+        digest = input_digest(tool_input)
+        with self._cond:
+            if not hmac.compare_digest(digest, sha) or digest not in scope._approved_focus:
+                return Verdict(False, "this focus change was not approved")
+            scope._approved_focus.remove(digest)  # one-shot
+        command, problem = tool_command(tool_input)
+        if command is None:
+            return Verdict(False, problem or "invalid focus request")
+        text, is_error = service.command(command, source=AGENT_SOURCE)
+        log.info("focus %s %s -> %s", scope.name, command.kind, "error" if is_error else "ok")
+        return Verdict(not is_error, text[:4000])  # our own texts; item texts were cleaned on entry
 
     # --- socket lifecycle ---
 

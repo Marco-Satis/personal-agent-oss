@@ -26,10 +26,12 @@ PROTOCOL = 1
 SERVER_NAME = "pa"
 TOOL_NAME = "approve"
 DELEGATE_TOOL_NAME = "delegate_task"   # offered only with PA_APPROVAL_DELEGATE=1 (main session)
+FOCUS_TOOL_NAME = "focus"              # offered only with PA_APPROVAL_FOCUS=1 (main session, module focus)
 ENV_SOCKET = "PA_APPROVAL_SOCKET"
 ENV_TOKEN = "PA_APPROVAL_TOKEN"
 ENV_TIMEOUT = "PA_APPROVAL_TIMEOUT_S"
 ENV_DELEGATE = "PA_APPROVAL_DELEGATE"
+ENV_FOCUS = "PA_APPROVAL_FOCUS"
 ENV_PREFIX = "PA_APPROVAL_"
 MAX_DELEGATE_TEXT = 300
 TASK_ID_CHARS = frozenset("0123456789abcdef")
@@ -75,6 +77,31 @@ DELEGATE_SCHEMA = {
     },
 }
 DELEGATE_NOTE = "The person is notified when it finishes. Do not wait for it."
+
+MAX_FOCUS_TEXT = 300
+FOCUS_SCHEMA = {
+    "name": FOCUS_TOOL_NAME,
+    "description": (
+        "Read or change the person's focus lists (at most 3 open items per list), inbox, later list, "
+        "shopping list and joy island. op: show (list = focus for the whole board, or another list), "
+        "add (list, text; shared=true for the shared list, private=true for a private item), "
+        "move (item_id to list; shared=true moves it to the shared focus list), done (item_id), "
+        "drop (item_id; reversible). You act for the person you talk to, with their rights."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "op": {"type": "string", "enum": ["show", "add", "move", "done", "drop"]},
+            "list": {"type": "string", "enum": ["focus", "inbox", "later", "shopping", "joy"]},
+            "text": {"type": "string", "maxLength": MAX_FOCUS_TEXT},
+            "item_id": {"type": "integer", "minimum": 1},
+            "shared": {"type": "boolean"},
+            "private": {"type": "boolean"},
+        },
+        "required": ["op"],
+    },
+}
 
 
 def deny(message: str) -> dict:
@@ -210,6 +237,27 @@ def ask_broker_delegate(socket_path: str, token: str, arguments: object, timeout
     return _tool_text(f"delegation refused: {message}", is_error=True)
 
 
+def ask_broker_focus(socket_path: str, token: str, arguments: object, timeout_s: float) -> dict:
+    """Run one approved focus change; the broker answers with the text to show."""
+    if not isinstance(arguments, dict) or not socket_path or not token:
+        return _tool_text("focus refused: invalid request", is_error=True)
+    frame = {
+        "v": PROTOCOL,
+        "op": "focus",
+        "token": token,
+        "input": shrink_input(arguments),
+        "input_sha256": input_digest(arguments),
+    }
+    answer = _exchange(socket_path, frame, timeout_s)
+    if answer is None:
+        return _tool_text("focus refused: approval service unreachable", is_error=True)
+    message = answer.get("message")
+    message = message[:4000] if isinstance(message, str) and message else "not approved"
+    if answer.get("allow") is True:
+        return _tool_text(message)
+    return _tool_text(f"focus refused: {message}", is_error=True)
+
+
 def _timeout(env: dict) -> float:
     try:
         value = float(env.get(ENV_TIMEOUT) or DEFAULT_TIMEOUT_S)
@@ -257,8 +305,12 @@ def handle(msg: dict, env: dict) -> dict | None:
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        delegate = env.get(ENV_DELEGATE) == "1"
-        result = {"tools": [TOOL_SCHEMA, DELEGATE_SCHEMA] if delegate else [TOOL_SCHEMA]}
+        tools = [TOOL_SCHEMA]
+        if env.get(ENV_DELEGATE) == "1":
+            tools.append(DELEGATE_SCHEMA)
+        if env.get(ENV_FOCUS) == "1":
+            tools.append(FOCUS_SCHEMA)
+        result = {"tools": tools}
     elif method == "tools/call":
         name = params.get("name")
         if name == DELEGATE_TOOL_NAME and env.get(ENV_DELEGATE) == "1":
@@ -267,6 +319,12 @@ def handle(msg: dict, env: dict) -> dict | None:
                                              params.get("arguments"), _timeout(env))
             except Exception:  # noqa: BLE001 - any failure is a refusal
                 result = _tool_text("delegation refused: approval service failed", is_error=True)
+        elif name == FOCUS_TOOL_NAME and env.get(ENV_FOCUS) == "1":
+            try:
+                result = ask_broker_focus(env.get(ENV_SOCKET) or "", env.get(ENV_TOKEN) or "",
+                                          params.get("arguments"), _timeout(env))
+            except Exception:  # noqa: BLE001 - any failure is a refusal
+                result = _tool_text("focus refused: approval service failed", is_error=True)
         elif name != TOOL_NAME:
             return _error(msg_id, -32602, "unknown tool")
         else:
@@ -284,7 +342,7 @@ def scrub_environ(environ) -> None:
 
 
 def main() -> int:
-    env = {key: os.environ.get(key, "") for key in (ENV_SOCKET, ENV_TOKEN, ENV_TIMEOUT, ENV_DELEGATE)}
+    env = {key: os.environ.get(key, "") for key in (ENV_SOCKET, ENV_TOKEN, ENV_TIMEOUT, ENV_DELEGATE, ENV_FOCUS)}
     scrub_environ(os.environ)
     if not env[ENV_SOCKET] or not env[ENV_TOKEN]:
         print("approval server: socket or token missing, every request is denied", file=sys.stderr)

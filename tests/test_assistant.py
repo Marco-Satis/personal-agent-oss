@@ -31,7 +31,8 @@ def test_the_telegram_runtime_is_the_chat_runtime_with_less_reach(tmp_path):
         assert router.sessions is None and router.local_listings is False and router.note_source == "telegram"
         assert router.tasks.origin == "telegram" and router.tasks.runner_hint == SERVE_HINT
         assert router.tasks.coordinator is None  # board only: serve runs no helpers
-        assert runtime.main_session.config.extra_tools == ()
+        # no delegation; the focus tool acts for the person only and is offered on every channel
+        assert runtime.main_session.config.extra_tools == ("mcp__pa__focus",)
         assert router.latch.shared and router.latch.state_dir == config.state_dir
     finally:
         runtime.close()

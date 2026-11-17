@@ -50,6 +50,8 @@ SKILL_TOOL = "Skill"
 # The main assistant's tool to queue a background task (approval_server.DELEGATE_TOOL_NAME
 # on our own "pa" server). Defined here because this module must not import approval.
 DELEGATE_TOOL = "mcp__pa__delegate_task"
+# The main assistant's tool for the focus lists (approval_server.FOCUS_TOOL_NAME), module "focus".
+FOCUS_TOOL = "mcp__pa__focus"
 # Spike with Claude Code 2.1.302: plugin hooks run arbitrary commands even under
 # --restricted and --strict-mcp-config, with the session environment and the config
 # dir. "disableAllHooks" turns them off and keeps skills working (verified), and
@@ -72,7 +74,7 @@ HARDENED_SETTINGS = json.dumps(
         "disableAllHooks": True,
         "crossSessionInbound": "refuse",
         "permissions": {
-            "ask": [SKILL_TOOL, DELEGATE_TOOL],
+            "ask": [SKILL_TOOL, DELEGATE_TOOL, FOCUS_TOOL],
             "deny": ["SendMessage", "ListAgents", "Task", "Agent"],
         },
     },

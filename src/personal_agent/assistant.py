@@ -294,7 +294,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
     (the caller closes its task service and the broker)."""
     from .approval import PERMISSION_TOOL
     from .approval_server import SERVER_NAME
-    from .bridge import DEFAULT_TURN_TIMEOUT_S, DELEGATE_TOOL, BridgeConfig, ClaudeSession
+    from .bridge import DEFAULT_TURN_TIMEOUT_S, DELEGATE_TOOL, FOCUS_TOOL, BridgeConfig, ClaudeSession
     from .focus import OWNER_ID, FocusService, FocusStore, Person
     from .mail import MailService
     from .router import Router, RouterConfig
@@ -302,7 +302,12 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
 
     config, broker = parts.config, parts.broker
     delegation = bool(delegation and tasks is not None and broker.delegation_allowed)
+    # One person per installation until channels are paired per person (M4): the owner.
+    focus = FocusService(FocusStore(config.state_dir), Person(OWNER_ID), config.language) \
+        if "focus" in config.modules else None
     try:
+        if focus is not None:
+            broker.enable_focus(focus)  # rewrites mcp.json before the main session starts
         if delegation:
             broker.on_delegate = tasks.delegate  # type: ignore[union-attr]
             broker.enable_delegation()  # rewrites mcp.json before the main session starts
@@ -329,7 +334,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
             allowed_skills=parts.allowed_skills,
             oauth_token=config.claude_oauth_token,
             api_key=config.claude_api_key,
-            extra_tools=(DELEGATE_TOOL,) if delegation else (),
+            extra_tools=((DELEGATE_TOOL,) if delegation else ()) + ((FOCUS_TOOL,) if focus is not None else ()),
         ),
         extra_env=dict(parts.mcp_timeout),
         turn_timeout_s=max(DEFAULT_TURN_TIMEOUT_S, config.approval_timeout_s + 120),
@@ -368,9 +373,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
         # Tier-1 mail commands: the config file is only lstat'ed here; the worker process reads it.
         mail=MailService.from_config(config),
         time_awareness=TimeAwareness(config.state_dir, channel) if config.time_note else None,
-        # One person per installation until channels are paired per person (M4): the owner.
-        focus=FocusService(FocusStore(config.state_dir), Person(OWNER_ID), config.language)
-        if "focus" in config.modules else None,
+        focus=focus,
     )
     return AssistantRuntime(parts, main_session, small_session, router)
 

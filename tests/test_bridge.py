@@ -71,7 +71,7 @@ def test_args_always_disable_hooks_and_ask_for_skills(tmp_path):
     assert args[index + 2] == HARDENED_SETTINGS
     assert args[index + 2] == (
         '{"disableAllHooks":true,"crossSessionInbound":"refuse","permissions":'
-        '{"ask":["Skill","mcp__pa__delegate_task"],"deny":["SendMessage","ListAgents","Task","Agent"]}}'
+        '{"ask":["Skill","mcp__pa__delegate_task","mcp__pa__focus"],"deny":["SendMessage","ListAgents","Task","Agent"]}}'
     )
     assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents", "Task", "Agent"]
     assert args[args.index("--tools") + 1] == ""

@@ -237,6 +237,11 @@ inbox|später|einkauf|freude [privat] [<text>]   # show a list, or add to it
 ```
 
 English words work too (`focus`, `done`, `drop`, `later`, `shopping`, `joy`, `shared`, `private`).
+The assistant works on the same lists through its own tool (`mcp__pa__focus`): it can show, add, move,
+finish and drop items for the person it talks to, with that person's rights. Changes to your own and the
+shared lists run without a prompt; a change to someone else's list, and any change in a turn that carries
+note or skill context, asks you first. Every change is in the [audit log](#audit-log); dropped items can
+be moved back. Helpers never get the tool.
 `privat` items are seen and changed by their owner only. Rights follow the roles of a business
 installation (owner, office, employee, device: a device may only add to the inbox). The lists live in
 `state_dir/focus.db` (SQLite, 0600); [backups](#backups) take a consistent copy of it.
