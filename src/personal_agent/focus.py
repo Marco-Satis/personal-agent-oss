@@ -18,6 +18,7 @@ Rights come from roles.py; the caller (router) passes a trusted Person, never te
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -63,7 +64,22 @@ MIGRATIONS = (
     );
     CREATE INDEX items_owner ON items (owner, list, status);
     """,
+    # 2: the evening review per person (or "shared") and day: 1-2 highlights, "good day" points.
+    """
+    CREATE TABLE reviews (
+        owner TEXT NOT NULL,
+        day TEXT NOT NULL,
+        highlights TEXT NOT NULL DEFAULT '[]',
+        good_day TEXT NOT NULL DEFAULT '[]',
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (owner, day)
+    );
+    """,
 )
+MAX_HIGHLIGHTS = 2
+# What makes a good day (the agency's answer, 16.11.2026): basics, time as a couple, time alone,
+# sport, balance, progress at work.
+GOOD_DAY = ("basics", "couple", "alone", "sport", "balance", "work")
 
 _SPACES = re.compile(r"\s+")
 
@@ -317,6 +333,77 @@ class FocusStore:
         finally:
             conn.close()
 
+    # --- evening review -------------------------------------------------------------
+
+    def day_of(self, ts: float | None = None) -> str:
+        return datetime.fromtimestamp(self.clock() if ts is None else ts).strftime("%Y-%m-%d")
+
+    def review(self, person: Person, day: str | None = None) -> tuple[list[str], list[str]]:
+        """(highlights, good-day points) of the person's review for a day (default today)."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT highlights, good_day FROM reviews WHERE owner = ? AND day = ?",
+                               (person.id, day or self.day_of())).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return [], []
+        return _json_list(row[0]), [k for k in _json_list(row[1]) if k in GOOD_DAY]
+
+    def _save_review(self, person: Person, change: Callable[[list[str], list[str]], tuple[list[str], list[str]]]
+                     ) -> tuple[list[str], list[str]]:
+        if not allowed(person.role, "focus.edit_own"):
+            raise FocusError("your role may not change this list")
+        day = self.day_of()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT highlights, good_day FROM reviews WHERE owner = ? AND day = ?",
+                               (person.id, day)).fetchone()
+            current = (_json_list(row[0]), _json_list(row[1])) if row else ([], [])
+            highlights, good = change(*current)
+            conn.execute(
+                "INSERT INTO reviews (owner, day, highlights, good_day, updated_at) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (owner, day) DO UPDATE SET highlights = excluded.highlights,"
+                " good_day = excluded.good_day, updated_at = excluded.updated_at",
+                (person.id, day, json.dumps(highlights, ensure_ascii=False), json.dumps(good), self.clock()))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return highlights, good
+
+    def add_highlight(self, person: Person, text: str) -> tuple[list[str], list[str]]:
+        text = clean(text)
+
+        def change(highlights: list[str], good: list[str]) -> tuple[list[str], list[str]]:
+            if len(highlights) >= MAX_HIGHLIGHTS:
+                raise FocusError(f"already {MAX_HIGHLIGHTS} highlights today")
+            return highlights + [text], good
+        return self._save_review(person, change)
+
+    def set_good_day(self, person: Person, points: list[str]) -> tuple[list[str], list[str]]:
+        unknown = [p for p in points if p not in GOOD_DAY]
+        if unknown or not points:
+            raise FocusError("good-day points: " + ", ".join(GOOD_DAY))
+        return self._save_review(person, lambda h, _g: (h, [k for k in GOOD_DAY if k in points]))
+
+    def done_since(self, person: Person, since: float) -> list[Item]:
+        """Visible items finished since a time, all lists, oldest first."""
+        if not allowed(person.role, "dashboard.view"):
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM items WHERE status = 'done' AND done_at >= ? AND (visibility = 'team' OR owner = ?)"
+                " ORDER BY done_at, id LIMIT ?", (since, person.id, SHOW_LIMIT)).fetchall()
+        finally:
+            conn.close()
+        return [_item(row) for row in rows]
+
     def owner_of(self, person: Person, item_id: int) -> str | None:
         """The owner of an item the person may see, or None (missing or private to someone else)."""
         conn = self._connect()
@@ -340,6 +427,14 @@ class FocusStore:
             conn.close()
         others = sorted(r[0] for r in rows if r[0] not in (person.id, SHARED))
         return [person.id, SHARED] + others
+
+
+def _json_list(raw: object) -> list[str]:
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else []
+    except ValueError:
+        return []
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
 def _item(row: sqlite3.Row) -> Item:
@@ -366,6 +461,11 @@ LIST_WORDS = {
     "shopping": ("einkauf", "einkaufsliste", "shopping"),
     "joy": ("freude", "freudeinsel", "joy"),
 }
+REVIEW_WORDS = ("rückblick", "rueckblick", "review")
+GOOD_DAY_WORDS = {  # German and English words for the good-day points
+    "basics": "basics", "paar": "couple", "couple": "couple", "allein": "alone", "alone": "alone",
+    "sport": "sport", "balance": "balance", "beruf": "work", "arbeit": "work", "work": "work",
+}
 DONE_WORDS = ("erledigt", "done")
 DROP_WORDS = ("verwerfen", "drop")
 SHARED_WORDS = ("gemeinsam", "shared")
@@ -382,6 +482,15 @@ def parse_focus_command(text: str) -> FocusCommand | None:
     first, _, rest = s.partition(" ")
     word = first.lower()
     rest = rest.strip()
+    if word in REVIEW_WORDS:
+        return FocusCommand("review", arg=rest) if rest else FocusCommand("review_show")
+    second, _, tail = rest.partition(" ")
+    if (word, second.lower()) in (("guter", "tag"), ("good", "day")):
+        words = [w.lower().strip(",") for w in tail.split()]
+        points = [GOOD_DAY_WORDS.get(w, "?") for w in words if w]
+        if not points or "?" in points:
+            return FocusCommand("good_usage")
+        return FocusCommand("good_day", arg=" ".join(points))
     if word in DONE_WORDS or word in DROP_WORDS:
         match = _ID.fullmatch(rest)
         if not match:
@@ -450,7 +559,19 @@ TEXTS = {
         "full": "focus list full ({max}): #{id} went to Later",
         "done": "#{id} done: {text}", "dropped": "#{id} dropped: {text}", "moved": "#{id} moved to {list}",
         "usage": "usage: fokus [gemeinsam|privat] <text> · fokus #<n> [gemeinsam] · erledigt <n> · "
-                 "verwerfen <n> · inbox|später|einkauf|freude [privat] [<text>]",
+                 "verwerfen <n> · inbox|später|einkauf|freude [privat] [<text>] · rückblick [<highlight>] · "
+                 "guter tag basics|paar|allein|sport|balance|beruf",
+        "good_usage": "usage: guter tag <points> (basics, paar, allein, sport, balance, beruf)",
+        "review": "Review {day}", "highlights": "Highlights", "good_day": "Good day",
+        "finished": "Done today", "highlight_added": "highlight saved ({n}/{max})",
+        "good_saved": "good day: {points}",
+        "points": {"basics": "basics", "couple": "time as a couple", "alone": "time alone", "sport": "sport",
+                   "balance": "balance", "work": "progress at work"},
+        "brief_counts": "your focus {own}/{max} open · shared {shared} · inbox {inbox} · shopping {shopping}",
+        "evening_done": "Done today: {n}", "evening_open": "Still open in your focus: {items}",
+        "evening_hint": "Review: rückblick <highlight> (1-2) · guter tag sport paar … · "
+                        "move open items: später #<n> or fokus #<n>",
+        "joy_today": "Joy island: {text}",
     },
     "de": {
         "focus": "Fokus", "inbox": "Inbox", "later": "Später", "shopping": "Einkaufsliste", "joy": "Freudeinsel",
@@ -458,7 +579,19 @@ TEXTS = {
         "full": "Fokusliste voll ({max}): #{id} liegt unter Später",
         "done": "#{id} erledigt: {text}", "dropped": "#{id} verworfen: {text}", "moved": "#{id} nach {list} verschoben",
         "usage": "So geht es: fokus [gemeinsam|privat] <Text> · fokus #<n> [gemeinsam] · erledigt <n> · "
-                 "verwerfen <n> · inbox|später|einkauf|freude [privat] [<Text>]",
+                 "verwerfen <n> · inbox|später|einkauf|freude [privat] [<Text>] · rückblick [<Highlight>] · "
+                 "guter tag basics|paar|allein|sport|balance|beruf",
+        "good_usage": "So geht es: guter tag <Punkte> (basics, paar, allein, sport, balance, beruf)",
+        "review": "Rückblick {day}", "highlights": "Highlights", "good_day": "Guter Tag",
+        "finished": "Heute erledigt", "highlight_added": "Highlight gespeichert ({n}/{max})",
+        "good_saved": "Guter Tag: {points}",
+        "points": {"basics": "Basics", "couple": "Zeit als Paar", "alone": "Zeit allein", "sport": "Sport",
+                   "balance": "Balance", "work": "beruflicher Fortschritt"},
+        "brief_counts": "dein Fokus {own}/{max} offen · gemeinsam {shared} · Inbox {inbox} · Einkauf {shopping}",
+        "evening_done": "Heute erledigt: {n}", "evening_open": "Noch offen in deinem Fokus: {items}",
+        "evening_hint": "Rückblick: rückblick <Highlight> (1–2) · guter tag sport paar … · "
+                        "Offenes verschieben: später #<n> oder fokus #<n>",
+        "joy_today": "Freudeinsel: {text}",
     },
 }
 
@@ -501,6 +634,16 @@ class FocusService:
         t, store, person = self.t, self.store, self.person
         if cmd.kind == "usage":
             return t["usage"]
+        if cmd.kind == "good_usage":
+            return t["good_usage"]
+        if cmd.kind == "review":
+            highlights, _ = store.add_highlight(person, cmd.arg)
+            return t["highlight_added"].format(n=len(highlights), max=MAX_HIGHLIGHTS)
+        if cmd.kind == "good_day":
+            _, good = store.set_good_day(person, cmd.arg.split())
+            return t["good_saved"].format(points=", ".join(t["points"][k] for k in good))
+        if cmd.kind == "review_show":
+            return self._review()
         if cmd.kind == "done":
             item = store.complete(person, cmd.item_id)
             return t["done"].format(id=item.id, text=item.text)
@@ -520,6 +663,51 @@ class FocusService:
             return self._board()
         return self._render(t[cmd.list], store.items(person, cmd.list))
 
+    def _midnight(self) -> float:
+        now = datetime.fromtimestamp(self.store.clock())
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    def _review(self) -> str:
+        t = self.t
+        highlights, good = self.store.review(self.person)
+        done = self.store.done_since(self.person, self._midnight())
+        lines = [t["review"].format(day=self.store.day_of()), f"{t['finished']}:"]
+        lines += [f"  ✓ #{i.id} {i.text}" for i in done] or [f"  {t['empty']}"]
+        lines.append(f"{t['highlights']}:")
+        lines += [f"  ★ {h}" for h in highlights] or [f"  {t['empty']}"]
+        lines.append(f"{t['good_day']}: " + (", ".join(t["points"][k] for k in good) or t["empty"]))
+        return "\n".join(lines)
+
+    # --- views for the brief and the evening update (no model) -----------------------
+
+    def brief_view(self) -> tuple[str, list[str]]:
+        """(one line of counts, the lines with item texts) for the morning brief."""
+        t, store, person = self.t, self.store, self.person
+        own = store.items(person, "focus", owner=person.id)
+        shared = store.items(person, "focus", owner=SHARED)
+        inbox = store.items(person, "inbox")
+        shopping = store.items(person, "shopping")
+        joy = store.items(person, "joy")
+        counts = t["brief_counts"].format(own=len(own), max=MAX_FOCUS, shared=len(shared), inbox=len(inbox),
+                                          shopping=len(shopping))
+        lines = []
+        for title, items in ((f"{t['focus']} · {t['you']}", own), (f"{t['focus']} · {t['shared']}", shared)):
+            lines.append(f"{title}: " + ("; ".join(f"#{i.id} {i.text}" for i in items) or t["empty"]))
+        if joy:
+            lines.append(t["joy_today"].format(text=joy[0].text))
+        return counts, lines
+
+    def evening_lines(self) -> list[str]:
+        """What went well today and what is still open, plus how to do the review."""
+        t, store, person = self.t, self.store, self.person
+        done = store.done_since(person, self._midnight())
+        lines = [t["evening_done"].format(n=len(done)) + (": " + "; ".join(i.text for i in done[:5]) if done else "")]
+        still = store.items(person, "focus", owner=person.id)
+        if still:
+            lines.append(t["evening_open"].format(items="; ".join(f"#{i.id} {i.text}" for i in still)))
+        lines.append(t["evening_hint"])
+        return lines
+
     def _owner_label(self, owner: str) -> str:
         if owner == self.person.id:
             return self.t["you"]
@@ -528,8 +716,7 @@ class FocusService:
         return owner
 
     def _board(self) -> str:
-        midnight = datetime.fromtimestamp(self.store.clock()).replace(hour=0, minute=0, second=0, microsecond=0)
-        since = midnight.timestamp()
+        since = self._midnight()
         blocks = []
         for owner in self.store.focus_owners(self.person):
             items = self.store.items(self.person, "focus", owner=owner, include_done_since=since)
@@ -548,6 +735,6 @@ class FocusService:
 
 
 __all__ = [
-    "DB_FILE", "MAX_FOCUS", "OWNER_ID", "SHARED", "FocusCommand", "FocusError", "FocusService", "FocusStore", "Item",
+    "DB_FILE", "GOOD_DAY", "MAX_FOCUS", "MAX_HIGHLIGHTS", "OWNER_ID", "SHARED", "FocusCommand", "FocusError", "FocusService", "FocusStore", "Item",
     "Person", "parse_focus_command", "tool_command",
 ]

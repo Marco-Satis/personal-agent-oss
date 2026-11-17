@@ -290,3 +290,41 @@ def test_backup_fails_loudly_on_a_broken_database(tmp_path):
     with pytest.raises(BackupError, match="focus.db"):
         create_backup(state, tmp_path / "vault")
     assert list_backups(backup_dir(state)) == []  # no half archive left behind
+
+
+# --- F2: evening review, brief and evening views ---------------------------------------------------------
+
+
+def test_review_highlights_and_good_day(store):
+    svc = FocusService(store, A, "de")
+    svc.command(parse_focus_command("fokus Angebot"))
+    svc.command(parse_focus_command("erledigt 1"))
+    assert svc.command(parse_focus_command("rückblick Kunde war begeistert")) == ("Highlight gespeichert (1/2)", False)
+    assert svc.command(parse_focus_command("rückblick Sonne"))[0] == "Highlight gespeichert (2/2)"
+    text, err = svc.command(parse_focus_command("rückblick noch eins"))
+    assert err and "2 highlights" in text
+    assert svc.command(parse_focus_command("guter tag sport paar")) == ("Guter Tag: Zeit als Paar, Sport", False)
+    assert svc.command(parse_focus_command("guter tag fliegen"))[0].startswith("So geht es: guter tag")
+    shown = svc.command(parse_focus_command("rückblick"))[0]
+    assert "✓ #1 Angebot" in shown and "★ Kunde war begeistert" in shown and "Guter Tag: Zeit als Paar, Sport" in shown
+    # reviews are per person: the other owner has their own
+    assert store.review(B) == ([], [])
+    assert store.schema_version() == 2
+
+
+def test_device_cannot_write_a_review(store):
+    with pytest.raises(FocusError, match="role"):
+        store.add_highlight(DEV, "x")
+
+
+def test_brief_and_evening_views(store):
+    svc = FocusService(store, A, "de")
+    for text in ("fokus Angebot", "fokus gemeinsam Steuer", "inbox Idee", "einkauf Milch", "freude Kaffee draußen"):
+        svc.command(parse_focus_command(text))
+    counts, lines = svc.brief_view()
+    assert counts == "dein Fokus 1/3 offen · gemeinsam 1 · Inbox 1 · Einkauf 1"
+    assert lines == ["Fokus · du: #1 Angebot", "Fokus · gemeinsam: #2 Steuer", "Freudeinsel: Kaffee draußen"]
+    svc.command(parse_focus_command("erledigt 2"))
+    evening = svc.evening_lines()
+    assert evening[0] == "Heute erledigt: 1: Steuer" and evening[1] == "Noch offen in deinem Fokus: #1 Angebot"
+    assert evening[2].startswith("Rückblick:")
