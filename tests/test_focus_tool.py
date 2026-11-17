@@ -179,3 +179,39 @@ def test_tool_command_maps_shared_add():
     command, problem = tool_command({"op": "add", "list": "focus", "text": "Steuer", "shared": True})
     assert problem is None and command.shared and command.list == "focus"
     assert SHARED == "shared"
+
+
+def test_assistant_does_the_evening_review(env):
+    broker, store, _ = env
+    me = Person(OWNER_ID)
+    run(broker, {"op": "add", "list": "focus", "text": "Angebot"})
+    verdict, result = run(broker, {"op": "matrix", "item_id": 1, "quadrant": "do"})
+    assert verdict.allow and text(result) == "#1: do now" and store.matrix_of(1) == (True, True)
+    verdict, result = run(broker, {"op": "matrix", "item_id": 1, "quadrant": "drop"})
+    assert text(result) == "#1: drop" and store.matrix_of(1) == (False, False)
+    assert text(run(broker, {"op": "highlight", "text": "Kunde zufrieden"})[1]) == "highlight saved (1/2)"
+    assert text(run(broker, {"op": "good_day", "points": ["sport", "work"]})[1]) == \
+        "good day: sport, progress at work"
+    assert store.review(me) == (["Kunde zufrieden"], ["sport", "work"])
+    assert broker.channel.calls == []  # all on the person's own things: no prompt
+
+
+@pytest.mark.parametrize("data, message", [
+    ({"op": "matrix", "item_id": 1}, "matrix needs"),
+    ({"op": "matrix", "item_id": 1, "quadrant": "now"}, "matrix needs"),
+    ({"op": "highlight", "text": " "}, "highlight needs"),
+    ({"op": "good_day", "points": []}, "good_day needs"),
+    ({"op": "good_day", "points": ["party"]}, "good_day needs"),
+])
+def test_bad_review_input_is_denied_without_asking(env, data, message):
+    broker, _, _ = env
+    verdict, _ = run(broker, data)
+    assert not verdict.allow and message in verdict.message and broker.channel.calls == []
+
+
+def test_matrix_on_someone_elses_item_asks(env):
+    broker, store, _ = env
+    other, _ = store.add(Person("partner", Role.OWNER), "partner's item", "focus")
+    broker.channel.answer = False
+    verdict, _ = run(broker, {"op": "matrix", "item_id": other.id, "quadrant": "do"})
+    assert not verdict.allow and len(broker.channel.calls) == 1 and store.matrix_of(other.id) is None

@@ -86,18 +86,24 @@ FOCUS_SCHEMA = {
         "shopping list and joy island. op: show (list = focus for the whole board, or another list), "
         "add (list, text; shared=true for the shared list, private=true for a private item), "
         "move (item_id to list; shared=true moves it to the shared focus list), done (item_id), "
-        "drop (item_id; reversible). You act for the person you talk to, with their rights."
+        "drop (item_id; reversible), matrix (item_id, quadrant: do|plan|delegate|drop, Eisenhower), "
+        "highlight (text: one of at most 2 highlights of today's review), good_day (points: what made the "
+        "day good). You act for the person you talk to, with their rights."
     ),
     "inputSchema": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "op": {"type": "string", "enum": ["show", "add", "move", "done", "drop"]},
+            "op": {"type": "string", "enum": ["show", "add", "move", "done", "drop", "matrix", "highlight",
+                                              "good_day"]},
             "list": {"type": "string", "enum": ["focus", "inbox", "later", "shopping", "joy"]},
             "text": {"type": "string", "maxLength": MAX_FOCUS_TEXT},
             "item_id": {"type": "integer", "minimum": 1},
             "shared": {"type": "boolean"},
             "private": {"type": "boolean"},
+            "quadrant": {"type": "string", "enum": ["do", "plan", "delegate", "drop"]},
+            "points": {"type": "array", "maxItems": 6, "items": {
+                "type": "string", "enum": ["basics", "couple", "alone", "sport", "balance", "work"]}},
         },
         "required": ["op"],
     },

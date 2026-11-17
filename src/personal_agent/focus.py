@@ -552,7 +552,7 @@ def parse_focus_command(text: str) -> FocusCommand | None:
     return FocusCommand("add", list_name, rest, shared=shared, private=private)
 
 
-TOOL_KEYS = frozenset({"op", "list", "text", "item_id", "shared", "private"})
+TOOL_KEYS = frozenset({"op", "list", "text", "item_id", "shared", "private", "quadrant", "points"})
 AGENT_SOURCE = "agent"
 
 
@@ -577,6 +577,20 @@ def tool_command(tool_input: object) -> tuple[FocusCommand | None, str | None]:
         if not list_name or not text.strip() or len(text) > MAX_TEXT or (shared and private):
             return None, f"add needs list and 1 to {MAX_TEXT} characters of text, not shared and private at once"
         return FocusCommand("add", list_name, text, shared=shared, private=private), None
+    if op == "matrix":
+        quadrant = tool_input.get("quadrant")
+        if item_id < 1 or quadrant not in ("do", "plan", "delegate", "drop"):
+            return None, "matrix needs item_id and quadrant (do, plan, delegate, drop)"
+        return FocusCommand("matrix", arg={"drop": "delete"}.get(quadrant, quadrant), item_id=item_id), None
+    if op == "highlight":
+        if not text.strip() or len(text) > MAX_TEXT:
+            return None, f"highlight needs 1 to {MAX_TEXT} characters of text"
+        return FocusCommand("review", arg=text), None
+    if op == "good_day":
+        points = tool_input.get("points")
+        if not isinstance(points, list) or not points or not all(p in GOOD_DAY for p in points):
+            return None, "good_day needs points: " + ", ".join(GOOD_DAY)
+        return FocusCommand("good_day", arg=" ".join(points)), None
     if op in ("move", "done", "drop"):
         if item_id < 1:
             return None, f"{op} needs item_id"
@@ -657,8 +671,8 @@ class FocusService:
         """
         if cmd.kind in ("show", "usage"):
             return True
-        if cmd.kind == "add":
-            return True  # add never names another owner
+        if cmd.kind in ("add", "review", "good_day"):
+            return True  # never names another owner; reviews are the person's own
         owner = self.store.owner_of(self.person, cmd.item_id)
         return owner in (self.person.id, SHARED)
 
