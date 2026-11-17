@@ -57,7 +57,7 @@ CHAT_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "Skill")
 STATE_ENTRIES = ("brief.json", "brief.lock", "brief-chunks.json", "brief-polished.json", "plugins.json", "quota.json",
                  "tasks.json", "tasks.lock", "tasks-owner.lock", "telegram-owner.json", "telegram-pairing.json",
                  "telegram-offset.json", "telegram.lock", "safety-stop.json", "approval-pinlock.json",
-                 "mail-cache.json", "mail.lock")
+                 "mail-cache.json", "mail.lock", "focus.db", "focus.db-journal")
 DELEGATION_PROMPT = """
 You can queue background work with the tool mcp__pa__delegate_task (text up to 300 characters,
 optional domain). Use it only when the person asks for background work. The person must approve
@@ -295,6 +295,7 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
     from .approval import PERMISSION_TOOL
     from .approval_server import SERVER_NAME
     from .bridge import DEFAULT_TURN_TIMEOUT_S, DELEGATE_TOOL, BridgeConfig, ClaudeSession
+    from .focus import OWNER_ID, FocusService, FocusStore, Person
     from .mail import MailService
     from .router import Router, RouterConfig
     from .vault import VAULT_SYSTEM_PROMPT
@@ -367,6 +368,9 @@ def finish_assistant(parts: AssistantParts, *, tasks: "TaskService | None", dele
         # Tier-1 mail commands: the config file is only lstat'ed here; the worker process reads it.
         mail=MailService.from_config(config),
         time_awareness=TimeAwareness(config.state_dir, channel) if config.time_note else None,
+        # One person per installation until channels are paired per person (M4): the owner.
+        focus=FocusService(FocusStore(config.state_dir), Person(OWNER_ID), config.language)
+        if "focus" in config.modules else None,
     )
     return AssistantRuntime(parts, main_session, small_session, router)
 

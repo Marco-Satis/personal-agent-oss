@@ -9,7 +9,11 @@ Left out on purpose:
 - the backup directory itself (no backup inside the next backup),
 - the Claude Code config directory: it holds the CLI login (an OAuth token) and caches;
   after a restore you log in again with `claude setup-token`,
-- runtime files: `run/` (sockets, worker pipes), `*.lock`, `*.tmp`, sockets and symlinks.
+- runtime files: `run/` (sockets, worker pipes), `*.lock`, `*.tmp`, sockets and symlinks,
+  and SQLite journals (`*.db-journal`, `*-wal`, `*-shm`).
+
+SQLite databases (`*.db`, e.g. focus.db) are not copied byte by byte: a write in progress
+could leave a torn copy. They go through sqlite3's online backup into a temporary file first.
 
 The archive still holds private data (notes, mail metadata, approvals, the Telegram pairing),
 so it stays 0600 in a 0700 folder. A copy on the same disk does not protect against losing
@@ -23,7 +27,9 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import stat
+import tempfile
 import tarfile
 import time
 from dataclasses import dataclass
@@ -34,7 +40,7 @@ DEFAULT_KEEP = 7
 MAX_KEEP = 90
 NAME_RE = re.compile(r"pa-backup-\d{8}-\d{6}\.tar\.gz")
 SKIP_DIRS = frozenset({"run", BACKUP_DIR_NAME})
-SKIP_SUFFIXES = (".lock", ".tmp")
+SKIP_SUFFIXES = (".lock", ".tmp", ".db-journal", ".db-wal", ".db-shm")
 ROOTS = ("state", "vault")
 
 
@@ -103,6 +109,25 @@ def _filtered(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
+def _add_sqlite(tar: tarfile.TarFile, path: Path, arcname: str) -> None:
+    """A consistent copy of a SQLite database, made with the online backup API."""
+    with tempfile.TemporaryDirectory(prefix="pa-backup-") as tmp:
+        copy = Path(tmp) / "copy.db"
+        # Read-write on purpose: a hot journal left by a crash must be rolled back first,
+        # which a read-only connection refuses. The backup itself only reads.
+        source = sqlite3.connect(path, timeout=5)
+        try:
+            target = sqlite3.connect(copy)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+        os.chmod(copy, 0o600)
+        tar.add(copy, arcname=arcname, recursive=False, filter=_filtered)
+
+
 def create_backup(state_dir: Path, vault_dir: Path, *, claude_config_dir: Path | None = None,
                   dest: Path | None = None, keep: int = DEFAULT_KEEP, now: float | None = None) -> BackupResult:
     state_dir, vault_dir = Path(state_dir), Path(vault_dir)
@@ -128,8 +153,14 @@ def create_backup(state_dir: Path, vault_dir: Path, *, claude_config_dir: Path |
             for root_name, root in sources:
                 tar.add(root, arcname=root_name, recursive=False, filter=_filtered)
                 for path, rel in _walk(root, skip):
+                    arcname = f"{root_name}/{rel.as_posix()}"
                     try:
-                        tar.add(path, arcname=f"{root_name}/{rel.as_posix()}", recursive=False, filter=_filtered)
+                        if path.suffix == ".db" and path.is_file():
+                            _add_sqlite(tar, path, arcname)
+                        else:
+                            tar.add(path, arcname=arcname, recursive=False, filter=_filtered)
+                    except sqlite3.Error as exc:
+                        raise BackupError(f"could not copy the database {rel.as_posix()}: {exc}") from None
                     except OSError:
                         continue  # a file that vanished or became unreadable while packing
                     files += path.is_file()

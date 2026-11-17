@@ -36,6 +36,8 @@ MODULES: tuple[Module, ...] = (
     Module("telegram", "both", "Telegram bot: notices, approvals, chat", "PA_TELEGRAM_"),
     Module("voice", "private", "Telegram voice messages through a local speech recognizer", "PA_STT_",
            needs=("stt",)),
+    Module("focus", "both", "focus lists (3 per person and shared), inbox, later, shopping list, joy island",
+           "PA_FOCUS_"),
     Module("mail", "both", "read mail, sort it, payment check, reply drafts (never sends)", "PA_MAIL_",
            needs=("imap",)),
 )

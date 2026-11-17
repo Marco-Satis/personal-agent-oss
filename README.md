@@ -91,7 +91,7 @@ personal-agent chat
 personal-agent modules                   # access mode, usage, and which modules run
 ```
 
-**Modules.** The core always runs; the brief, background tasks, domains and the Telegram bot are modules.
+**Modules.** The core always runs; the brief, background tasks, domains, focus lists and the Telegram bot are modules.
 `PA_MODULES=brief,telegram` runs only those (default: all; `none` runs the core alone). A module switched
 off here wins over its own settings.
 
@@ -220,6 +220,26 @@ agent[1]> task 3f2a9c queued (0 running, 0 ahead) · result: outputs/tasks/3f2a9
   delegation needs your approval (level 3 with `confirm` when the turn carries note or skill context),
   at most one per turn; the assistant only gets the task id back, never the result. Delegated tasks are
   marked `[delegated]`.
+
+### Focus lists
+
+Module `focus`: a focus list per person with **at most three open items**, a shared list, an inbox for
+everything that comes to mind, a "later" list, a shopping list and a joy island (one nice thing a day).
+The commands are answered without a model, in the chat, over Telegram and ntfy:
+
+```
+fokus                         # today's board: yours, shared, then the others' (done items stay until midnight)
+fokus Angebot schreiben       # add to your focus list; a fourth open item goes to "later" instead
+fokus gemeinsam Steuer        # add to the shared list
+fokus #12 [gemeinsam]         # move item 12 (e.g. from the inbox) to a focus list; refused when it is full
+erledigt 12 · verwerfen 12    # done / dropped; nothing is ever deleted
+inbox|später|einkauf|freude [privat] [<text>]   # show a list, or add to it
+```
+
+English words work too (`focus`, `done`, `drop`, `later`, `shopping`, `joy`, `shared`, `private`).
+`privat` items are seen and changed by their owner only. Rights follow the roles of a business
+installation (owner, office, employee, device: a device may only add to the inbox). The lists live in
+`state_dir/focus.db` (SQLite, 0600); [backups](#backups) take a consistent copy of it.
 
 ### Domains
 

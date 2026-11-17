@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .focus import FocusService, parse_focus_command
 from .bridge import MAX_PROMPT_CHARS, SKILL_TOOL, UnexpectedOutput
 from .mail import NOT_CONFIGURED, MailCommand, parse_mail_command
 from .quota import API_KEY_SOURCE, RESET_COMMAND, SUBSCRIPTION_KEY_SOURCE, QuotaGuard, is_overage
@@ -502,8 +503,10 @@ class Router:
         channel: str = "console",
         mail: "MailService | None" = None,
         time_awareness: "TimeAwareness | None" = None,
+        focus: FocusService | None = None,
     ) -> None:
         self.main = main
+        self.focus = focus  # None: module "focus" is off or there is no state directory
         self.time_awareness = time_awareness  # None: no time note (tests, PA_TIME_NOTE=off)
         # Trusted: "telegram" (or "ntfy") for serve's remote assistants. Mail output follows PA_MAIL_TELEGRAM
         # there: every channel that leaves this machine gets the same mail rules.
@@ -572,6 +575,8 @@ class Router:
                 "Domains (memory per topic for tasks, wiki/domains/<name>.md): domains lists them; "
                 "domain <name> shows one."
             )
+        if self.focus is not None:
+            lines.append(self.focus.help_line())
         if self.mail is not None:
             line = self.mail.help_line(self.channel)
             if line:
@@ -672,7 +677,8 @@ class Router:
     def is_tier1(self, text: str) -> bool:
         """Whether handle(text) answers without any model (notes, task commands, fixed answers)."""
         if prefix_command(text) is not None or parse_command(text) is not None \
-                or parse_mail_command(text) is not None:
+                or parse_mail_command(text) is not None \
+                or (self.focus is not None and parse_focus_command(text) is not None):
             return True
         tier, body = choose_tier(text, self.config)
         return tier == 1 or not body or slash_problem(body, self.slash_commands) is not None
@@ -687,6 +693,11 @@ class Router:
         mail_command = parse_mail_command(text)
         if mail_command is not None:
             return self._mail_command(mail_command)
+        if self.focus is not None:
+            focus_command = parse_focus_command(text)
+            if focus_command is not None:
+                text_out, is_error = self.focus.command(focus_command)  # tier 1: no model, no quota
+                return Reply(text_out, 1, is_error=is_error)
         tier, body = choose_tier(text, self.config)
         if tier == 1:
             return Reply(self._fixed(body), 1)
