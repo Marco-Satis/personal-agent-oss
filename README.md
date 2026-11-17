@@ -516,7 +516,7 @@ same commands, focus lists and rules as the chat. Off by default.
 ```
 personal-agent devices add iphone        # prints a device token once: put it into the shortcut
 PA_CHAT_DEVICES=on                       # then restart serve
-tailscale serve --bg 8787                # reach serve from your tailnet over HTTPS
+tailscale serve --bg --https=8787 http://127.0.0.1:8787   # tailnet HTTPS on its own port
 personal-agent devices list | revoke iphone
 ```
 

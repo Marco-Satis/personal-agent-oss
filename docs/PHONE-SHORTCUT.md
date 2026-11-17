@@ -13,10 +13,12 @@ to your own agent and reads the answer aloud. The phone only relays; everything 
    ```
    Set `PA_CHAT_DEVICES=on`, restart `serve`, then share it in your tailnet:
    ```
-   tailscale serve --bg 8787
-   tailscale serve status                 # shows https://<machine>.<tailnet>.ts.net
+   tailscale serve status                 # see what is already shared, do not overwrite it
+   tailscale serve --bg --https=8787 http://127.0.0.1:8787
    ```
-3. Check from a device in your tailnet: `https://<machine>.<tailnet>.ts.net/chat` must answer
+   This shares the agent on its own HTTPS port (`https://<machine>.<tailnet>.ts.net:8787`) and leaves
+   port 443 alone, which may already serve something else. Undo: `tailscale serve --https=8787 off`.
+3. Check from a device in your tailnet: `https://<machine>.<tailnet>.ts.net:8787/chat` must answer
    **401** without a token (404 means `PA_CHAT_DEVICES` is off or the request did not come through
    `tailscale serve`).
 
@@ -27,7 +29,7 @@ In the Shortcuts app, new shortcut, name it what you want to say after "Hey Siri
 
 1. **Dictate Text** (language: yours).
 2. **Get Contents of URL**
-   - URL: `https://<machine>.<tailnet>.ts.net/chat`
+   - URL: `https://<machine>.<tailnet>.ts.net:8787/chat`
    - Method: `POST`
    - Headers: `Authorization` = `Bearer <your device token>`, `Content-Type` = `application/json`
    - Request Body: JSON, one field `text` = *Dictated Text*
@@ -41,7 +43,7 @@ so the token does not travel with the shortcut.
 
 The agent waits up to 25 seconds. If the answer takes longer, the reply has no `reply` but an `id`.
 Add an **If** after step 3: when there is no `reply`, call **Get Contents of URL** again with
-`GET https://<machine>.<tailnet>.ts.net/chat/<id>?wait=25` and the same `Authorization` header.
+`GET https://<machine>.<tailnet>.ts.net:8787/chat/<id>?wait=25` and the same `Authorization` header.
 
 ## Safety
 
