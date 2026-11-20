@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from fake_imap import FakeIMAP, Folder, Msg
+from fake_imap import MONTHS, FakeIMAP, Folder, Msg
 from mail_helpers import PASSWORD, account, certs, plain, write_config  # noqa: F401 - certs is a fixture
 from personal_agent import mail_worker
 from personal_agent.mail import WorkerClient, WorkerError
@@ -318,7 +318,12 @@ def test_describe_check_and_bad_requests(server, certs):
 
 
 def test_worker_subprocess_end_to_end(server, certs, tmp_path):
-    srv = server()
+    # The subprocess scans relative to the real date.today(), so the mails must be recent, not the fixed TODAY.
+    now = date.today()
+    recent = f"{now.day:02d}-{MONTHS[now.month - 1]}-{now.year} 08:12:00 +0100"
+    srv = server(folders={"INBOX": inbox(Msg(1, plain(), internaldate=recent),
+                                         Msg(2, plain(subject="Second", sender="Bob <bob@example.net>"),
+                                             {"\\Seen"}, internaldate=recent))})
     path = write_config(tmp_path / "mail.json", [account(port=srv.port, ca_file=certs.ca)])
     client = WorkerClient(path, 20, run_dir=tmp_path / "state" / "run",
                           env_base={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": "x", "PA_TELEGRAM_TOKEN": "y"})
