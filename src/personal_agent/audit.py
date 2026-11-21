@@ -10,7 +10,11 @@ the broker's own fixed texts. It never holds the tool input (paths, mail text, n
 anything a sender wrote. The log is append-only for the agent, 0600, capped at MAX_BYTES (the
 oldest lines go first); `personal-agent audit` shows the newest lines.
 
-Later (roles, M4) the person who answered is added; today there is one owner per installation.
+With roles (M4) a line can name the person who answered (`person`, a login id, never a name
+from outside). Changes to shared state (for example the focus lists) get their own lines
+(`action: "change"`): who changed it (`person`), whether the person or the assistant acting
+for the person did it (`actor`), the area, the operation and a target such as `item:12`.
+Item texts, list contents and settings values are never written, only ids and fixed words.
 """
 
 from __future__ import annotations
@@ -36,8 +40,12 @@ def _text(value: object, limit: int = 120) -> str:
     return _TEXT_RE.sub("?", str(value))[:limit] if value is not None else ""
 
 
+ACTORS = ("person", "assistant")
+_TARGET_RE = re.compile(r"(?:[a-z_]{1,20}:)?[A-Za-z0-9_.\-]{1,40}")
+
+
 def record_approval(state_dir: Path | str, *, scope: str, channel: str, tool: str, level: int | None,
-                    allow: bool, reason: str, now: float | None = None) -> None:
+                    allow: bool, reason: str, now: float | None = None, person: str | None = None) -> None:
     entry = {
         "ts": round(time.time() if now is None else now, 3),
         "action": "approval",
@@ -48,6 +56,28 @@ def record_approval(state_dir: Path | str, *, scope: str, channel: str, tool: st
         "decision": "allow" if allow else "deny",
         "reason": _text(reason),
     }
+    if person is not None:
+        entry["person"] = _name(person)
+    _append(state_dir, entry)
+
+
+def record_change(state_dir: Path | str, *, person: str, actor: str, area: str, op: str,
+                  target: str | None = None, now: float | None = None) -> None:
+    """One line per change to shared state: ids and fixed words only, never the changed text."""
+    entry = {
+        "ts": round(time.time() if now is None else now, 3),
+        "action": "change",
+        "person": _name(person),
+        "actor": actor if actor in ACTORS else "?",
+        "area": _name(area),
+        "op": _name(op),
+    }
+    if target is not None:
+        entry["target"] = target if isinstance(target, str) and _TARGET_RE.fullmatch(target) else "?"
+    _append(state_dir, entry)
+
+
+def _append(state_dir: Path | str, entry: dict) -> None:
     directory = Path(state_dir)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / AUDIT_FILE
@@ -85,9 +115,14 @@ def read_audit(state_dir: Path | str, last: int = 20) -> list[dict]:
 
 def format_entry(entry: dict) -> str:
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry["ts"]))
+    who = f"  by {_name(entry.get('person'))}" if "person" in entry else ""
+    if entry.get("action") == "change":
+        target = f" {_name(entry.get('target'))}" if "target" in entry else ""
+        return (f"{when}  change  {_name(entry.get('area'))}.{_name(entry.get('op'))}{target}"
+                f"  [{_name(entry.get('actor'))}]{who}")
     level = entry.get("level")
     return (f"{when}  {_name(entry.get('decision'))}  level {level if level else '-'}  {_name(entry.get('tool'))}"
-            f"  [{_name(entry.get('scope'))} via {_name(entry.get('channel'))}]  {_text(entry.get('reason'))}")
+            f"  [{_name(entry.get('scope'))} via {_name(entry.get('channel'))}]  {_text(entry.get('reason'))}{who}")
 
 
-__all__ = ["AUDIT_FILE", "format_entry", "read_audit", "record_approval"]
+__all__ = ["ACTORS", "AUDIT_FILE", "format_entry", "read_audit", "record_approval", "record_change"]

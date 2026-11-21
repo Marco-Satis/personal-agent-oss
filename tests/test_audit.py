@@ -6,7 +6,7 @@ import stat
 import time
 
 from personal_agent import audit
-from personal_agent.audit import AUDIT_FILE, format_entry, read_audit, record_approval
+from personal_agent.audit import AUDIT_FILE, format_entry, read_audit, record_approval, record_change
 from personal_agent.cli import main
 
 NOW = time.mktime((2026, 11, 14, 15, 0, 0, 0, 0, -1))
@@ -47,3 +47,41 @@ def test_cli_shows_the_newest_lines(tmp_path, monkeypatch, capsys):
                     reason="approval timed out", now=NOW)
     assert main(["audit", "--last", "5"]) == 0
     assert "deny  level 2  Write  [main via chat]  approval timed out" in capsys.readouterr().out
+
+
+# --- B9 part 2 (AOS-PA-05): the person per entry and change lines -------------------------------------------
+
+
+def test_approval_can_name_the_person_who_answered(tmp_path):
+    record_approval(tmp_path, scope="main", channel="chat", tool="Write", level=2, allow=True,
+                    reason="approved by the person", now=NOW, person="owner-b")
+    record_approval(tmp_path, scope="main", channel="chat", tool="Write", level=2, allow=True,
+                    reason="approved by the person", now=NOW + 1, person="Robert'); DROP TABLE x")
+    first, second = read_audit(tmp_path)
+    assert first["person"] == "owner-b" and second["person"] == "?"
+    assert format_entry(first).endswith("approved by the person  by owner-b")
+
+
+def test_change_lines_hold_ids_and_fixed_words_never_text(tmp_path):
+    record_change(tmp_path, person="me", actor="assistant", area="focus", op="add", target="item:12", now=NOW)
+    record_change(tmp_path, person="me", actor="person", area="focus", op="drop", target="item:3 geheime Notiz",
+                  now=NOW + 1)
+    record_change(tmp_path, person="me", actor="robot", area="settings", op="set", target="brief_time", now=NOW + 2)
+    record_change(tmp_path, person="me", actor="person", area="focus", op="good_day", now=NOW + 3)
+    add, drop, setting, good = read_audit(tmp_path)
+    assert add == {"ts": NOW, "action": "change", "person": "me", "actor": "assistant", "area": "focus",
+                   "op": "add", "target": "item:12"}
+    assert drop["target"] == "?"  # free text never reaches the log
+    assert setting["actor"] == "?" and setting["target"] == "brief_time"
+    assert "target" not in good
+    assert "geheime" not in (tmp_path / AUDIT_FILE).read_text()
+    assert format_entry(add).endswith("change  focus.add item:12  [assistant]  by me")
+    assert format_entry(good).endswith("change  focus.good_day  [person]  by me")
+
+
+def test_old_lines_without_person_still_read_and_format(tmp_path):
+    with open(tmp_path / AUDIT_FILE, "w") as f:
+        f.write(json.dumps({"ts": NOW, "action": "approval", "scope": "main", "channel": "chat", "tool": "Edit",
+                            "level": 2, "decision": "allow", "reason": "ok"}) + "\n")
+    (entry,) = read_audit(tmp_path)
+    assert "by" not in format_entry(entry).split("ok")[-1]
