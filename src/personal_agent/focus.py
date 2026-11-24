@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from . import audit
 from .roles import Role, allowed
 from .textsafe import strip_invisible
 
@@ -678,50 +679,66 @@ class FocusService:
 
     def command(self, cmd: FocusCommand, source: str | None = None) -> tuple[str, bool]:
         try:
-            return self._run(cmd, source), False
+            text, change = self._run(cmd, source)
         except FocusError as exc:
             return str(exc), True
         except (OSError, sqlite3.Error) as exc:
             return f"focus unavailable: {type(exc).__name__}", True
+        if change is not None:
+            self._audit(cmd.kind, change, source)
+        return text, False
 
-    def _run(self, cmd: FocusCommand, source: str | None = None) -> str:
+    def _audit(self, op: str, target: str, source: str | None) -> None:
+        """One audit line per change: ids and fixed words, never the item text (B9 part 2, W1).
+
+        Best effort: a full disk or an unwritable log never undoes or fails the change itself.
+        """
+        try:
+            audit.record_change(self.store.path.parent, person=self.person.id,
+                                actor="assistant" if source == AGENT_SOURCE else "person",
+                                area="focus", op=op, target=target or None, now=self.store.clock())
+        except OSError:
+            pass
+
+    def _run(self, cmd: FocusCommand, source: str | None = None) -> tuple[str, str | None]:
+        """The reply and what changed: None for reads, "item:<id>" for an item, "" for the day's review."""
         t, store, person = self.t, self.store, self.person
         if cmd.kind == "usage":
-            return t["usage"]
+            return t["usage"], None
         if cmd.kind == "good_usage":
-            return t["good_usage"]
+            return t["good_usage"], None
         if cmd.kind == "matrix_usage":
-            return t["matrix_usage"]
+            return t["matrix_usage"], None
         if cmd.kind == "matrix":
             urgent, important = QUADRANTS[cmd.arg]
             item = store.set_matrix(person, cmd.item_id, urgent, important)
-            return t["matrix_set"].format(id=item.id, quadrant=t[QUADRANT_KEYS[(urgent, important)]])
+            return t["matrix_set"].format(id=item.id, quadrant=t[QUADRANT_KEYS[(urgent, important)]]), f"item:{item.id}"
         if cmd.kind == "review":
             highlights, _ = store.add_highlight(person, cmd.arg)
-            return t["highlight_added"].format(n=len(highlights), max=MAX_HIGHLIGHTS)
+            return t["highlight_added"].format(n=len(highlights), max=MAX_HIGHLIGHTS), ""
         if cmd.kind == "good_day":
             _, good = store.set_good_day(person, cmd.arg.split())
-            return t["good_saved"].format(points=", ".join(t["points"][k] for k in good))
+            return t["good_saved"].format(points=", ".join(t["points"][k] for k in good)), ""
         if cmd.kind == "review_show":
-            return self._review()
+            return self._review(), None
         if cmd.kind == "done":
             item = store.complete(person, cmd.item_id)
-            return t["done"].format(id=item.id, text=item.text)
+            return t["done"].format(id=item.id, text=item.text), f"item:{item.id}"
         if cmd.kind == "drop":
             item = store.drop(person, cmd.item_id)
-            return t["dropped"].format(id=item.id, text=item.text)
+            return t["dropped"].format(id=item.id, text=item.text), f"item:{item.id}"
         if cmd.kind == "move":
             item = store.move(person, cmd.item_id, cmd.list, SHARED if cmd.shared else None)
-            return t["moved"].format(id=item.id, list=t[item.list])
+            return t["moved"].format(id=item.id, list=t[item.list]), f"item:{item.id}"
         if cmd.kind == "add":
             owner = SHARED if cmd.shared else None
             item, landed = store.add(person, cmd.arg, cmd.list, owner=owner, private=cmd.private, source=source)
             if landed != cmd.list:
-                return t["full"].format(max=MAX_FOCUS, id=item.id)
-            return t["added"].format(id=item.id, list=t[landed])
+                return t["full"].format(max=MAX_FOCUS, id=item.id), f"item:{item.id}"
+            return t["added"].format(id=item.id, list=t[landed]), f"item:{item.id}"
         if cmd.list == "focus":
-            return self._board()
-        return self._render(t[cmd.list], store.items(person, cmd.list))
+            return self._board(), None
+        return self._render(t[cmd.list], store.items(person, cmd.list)), None
 
     def _midnight(self) -> float:
         now = datetime.fromtimestamp(self.store.clock())

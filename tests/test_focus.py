@@ -397,3 +397,62 @@ def test_matrix_follows_the_edit_rights(store):
     secret, _ = store.add(A, "secret", "inbox", private=True)
     with pytest.raises(FocusError, match=f"no item #{secret.id}"):
         store.set_matrix(B, secret.id, True, True)
+
+
+# --- B9 part 2, W1: every change leaves one audit line, never the item text ---------------------------------
+
+
+def _change_lines(state_dir):
+    from personal_agent.audit import read_audit
+
+    return [(e["op"], e.get("target"), e["actor"], e["person"])
+            for e in read_audit(state_dir, last=100) if e["action"] == "change"]
+
+
+def test_every_change_leaves_one_audit_line_without_text(store, tmp_path):
+    from personal_agent.audit import AUDIT_FILE, read_audit
+
+    svc = FocusService(store, A, "de")
+    for text in ("fokus geheime Notiz", "fokus Angebot", "inbox Idee", "später #3", "matrix 2 sofort",
+                 "erledigt 2", "verwerfen 1", "rückblick Kunde begeistert", "guter tag sport"):
+        assert not svc.command(parse_focus_command(text))[1], text
+    # reads, usage answers and refused changes leave nothing
+    for text in ("fokus", "später", "rückblick", "erledigt", "matrix 3", "guter tag fliegen", "erledigt 99",
+                 "erledigt 2"):
+        svc.command(parse_focus_command(text))
+    assert _change_lines(tmp_path) == [
+        ("add", "item:1", "person", "anna"), ("add", "item:2", "person", "anna"),
+        ("add", "item:3", "person", "anna"), ("move", "item:3", "person", "anna"),
+        ("matrix", "item:2", "person", "anna"), ("done", "item:2", "person", "anna"),
+        ("drop", "item:1", "person", "anna"), ("review", None, "person", "anna"),
+        ("good_day", None, "person", "anna"),
+    ]
+    raw = (tmp_path / AUDIT_FILE).read_text()
+    assert all(word not in raw for word in ("geheime", "Angebot", "Idee", "Kunde"))
+    assert all(e["ts"] == T0 for e in read_audit(tmp_path, last=100))  # the store's clock, not the wall clock
+
+
+def test_assistant_changes_are_marked_and_each_person_is_named(store, tmp_path):
+    from personal_agent.focus import AGENT_SOURCE, tool_command
+
+    anna = FocusService(store, A, "en")
+    command, problem = tool_command({"op": "add", "list": "focus", "text": "call the bank"})
+    assert problem is None and not anna.command(command, source=AGENT_SOURCE)[1]
+    anna.command(FocusCommand("done", item_id=1), source=AGENT_SOURCE)
+    anna.command(FocusCommand("show", "focus"), source=AGENT_SOURCE)  # a read by the assistant: no line
+    FocusService(store, B, "en").command(parse_focus_command("focus own thing"))
+    assert _change_lines(tmp_path) == [("add", "item:1", "assistant", "anna"), ("done", "item:1", "assistant", "anna"),
+                                       ("add", "item:2", "person", "ben")]
+
+
+def test_an_unwritable_audit_log_never_fails_the_change(store, tmp_path):
+    from personal_agent.audit import AUDIT_FILE
+
+    elsewhere = tmp_path / "elsewhere.txt"
+    elsewhere.write_text("")
+    (tmp_path / AUDIT_FILE).symlink_to(elsewhere)  # the log refuses symlinks, so the write fails
+    svc = FocusService(store, A, "en")
+    text, err = svc.command(parse_focus_command("focus still saved"))
+    assert not err and text == "added #1 to Focus"
+    assert [i.text for i in store.items(A, "focus")] == ["still saved"]
+    assert elsewhere.read_text() == ""

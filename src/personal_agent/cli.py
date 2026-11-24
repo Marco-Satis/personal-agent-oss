@@ -584,12 +584,12 @@ def _cmd_safety(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_audit(config: Config, args: argparse.Namespace) -> int:
-    """Show the newest approval decisions (tool, level, decision, never the input)."""
+    """Show the newest approval decisions and list changes (ids and fixed words, never the input)."""
     from .audit import format_entry, read_audit
 
     entries = read_audit(config.state_dir, max(1, min(args.last, 1000)))
     if not entries:
-        print("no approvals recorded yet")
+        print("no approvals or changes recorded yet")
     for entry in entries:
         print(format_entry(entry))
     return 0
@@ -799,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
     safety_sub.add_parser("status", help="show the safety stop")
     safety_sub.add_parser("clear", help="clear the safety stop (terminal only)")
 
-    audit = sub.add_parser("audit", help="the newest approval decisions (never the tool input)")
+    audit = sub.add_parser("audit", help="the newest approval decisions and list changes (never inputs or texts)")
     audit.add_argument("--last", type=int, default=20, help="how many lines (1-1000, default 20)")
 
     backup = sub.add_parser("backup", help="back up the state directory and the vault (never restores)")

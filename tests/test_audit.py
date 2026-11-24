@@ -42,7 +42,7 @@ def test_cli_shows_the_newest_lines(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("PA_STATE_DIR", str(tmp_path / "state"))
     assert main(["audit"]) == 0
-    assert "no approvals recorded yet" in capsys.readouterr().out
+    assert "no approvals or changes recorded yet" in capsys.readouterr().out
     record_approval(tmp_path / "state", scope="main", channel="chat", tool="Write", level=2, allow=False,
                     reason="approval timed out", now=NOW)
     assert main(["audit", "--last", "5"]) == 0

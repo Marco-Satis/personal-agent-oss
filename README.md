@@ -686,7 +686,10 @@ The model is downloaded on first use (about 500 MB for `small`) and read from di
 Every approval of level 2 (write) or 3 (danger), and every approval that failed, is written to
 `$PA_STATE_DIR/audit.jsonl`: time, session (`main` or a helper task), the channel you answered on,
 tool name, level, allow/deny and the reason. The tool input (paths, text, mail content) is never
-logged. The file is 0600 and capped at 1 MB. `personal-agent audit [--last N]` shows the newest lines.
+logged. Every change to the focus lists (add, done, drop, move, matrix, review, good day) gets a line
+too: who, whether you or the assistant made it, the operation and the item id (`item:12`), never the
+item text. A failed log write never undoes or blocks the change. The file is 0600 and capped at 1 MB.
+`personal-agent audit [--last N]` shows the newest lines.
 
 ### Backups
 
