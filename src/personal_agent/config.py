@@ -104,11 +104,13 @@ def _parse_public_approval_url(raw: str | None) -> str | None:
     return raw.rstrip("/")
 
 
-def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+def _parse_trusted_clients(raw: str | None, name: str = "PA_TRUSTED_CLIENTS",
+                           ) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     """Extra client networks allowed on /escalate and /internal/ (loopback always is).
 
     Needed when `serve` runs in a container: published ports reach it from the
-    bridge gateway (e.g. 172.17.0.1), not from loopback.
+    bridge gateway (e.g. 172.17.0.1), not from loopback. The same rules apply to
+    PA_TRUSTED_PROXIES (the proxies whose X-Forwarded-For the web listener believes).
     """
     if not raw:
         return ()
@@ -120,11 +122,37 @@ def _parse_trusted_clients(raw: str | None) -> tuple[ipaddress.IPv4Network | ipa
         try:
             network = ipaddress.ip_network(part, strict=False)
         except ValueError as exc:
-            raise ConfigError("PA_TRUSTED_CLIENTS must be a comma-separated list of IP networks") from exc
+            raise ConfigError(f"{name} must be a comma-separated list of IP networks") from exc
         if network.prefixlen == 0 or not network.is_private:
-            raise ConfigError("PA_TRUSTED_CLIENTS may only name private or loopback networks, not all addresses")
+            raise ConfigError(f"{name} may only name private or loopback networks, not all addresses")
         networks.append(network)
     return tuple(networks)
+
+
+DEFAULT_TRUSTED_PROXIES = "127.0.0.1,::1"  # tailscale serve and a local Caddy both connect from loopback
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _parse_web_origin(raw: str | None) -> str | None:
+    """PA_WEB_ORIGIN: the one origin the web app is served from, e.g. https://agent.tailnet.ts.net.
+
+    https only; plain http only for a loopback host (local tests). No path, query or user info,
+    because CSRF and passkeys compare it byte for byte with the browser's Origin.
+    """
+    if not raw:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(raw.strip())
+        port = parts.port
+    except ValueError as exc:
+        raise ConfigError("PA_WEB_ORIGIN is not a valid origin") from exc
+    host = (parts.hostname or "").lower()
+    netloc_host = f"[{host}]" if ":" in host else host
+    if (not host or parts.path not in ("", "/") or parts.query or parts.fragment or parts.username
+            or parts.password or parts.scheme not in ("https", "http")
+            or (parts.scheme == "http" and netloc_host not in _LOOPBACK_HOSTS)):
+        raise ConfigError("PA_WEB_ORIGIN must look like https://host[:port] (http only for 127.0.0.1)")
+    return f"{parts.scheme}://{netloc_host}" + (f":{port}" if port else "")
 
 
 NTFY_TOKEN_RE = re.compile(r"^tk_[A-Za-z0-9]{20,64}$")
@@ -340,6 +368,11 @@ class Config:
     ntfy_token: str | None = field(default=None, repr=False)  # PA_NTFY_TOKEN (secret, optional)
     ntfy_inbound: bool = False  # PA_NTFY_INBOUND: read the owner's messages from the same topic (default off)
     chat_devices: bool = False  # PA_CHAT_DEVICES: POST /chat for paired phones over tailscale serve (default off)
+    web_enabled: bool = False   # PA_WEB: the web listener for the app (L1), its own port
+    web_port: int = 8788        # PA_WEB_PORT
+    web_origin: str | None = None  # PA_WEB_ORIGIN: https://host[:port] the app is served from
+    # PA_TRUSTED_PROXIES: only their X-Forwarded-For counts for the client address (web listener)
+    trusted_proxies: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
     # PA_NOTIFY_<KIND>, only the kinds set explicitly, e.g. (("alert", ("discord",)),)
     notify_routes: tuple[tuple[str, tuple[str, ...]], ...] = ()
     brief_telegram: str = "full"       # PA_BRIEF_TELEGRAM: what the brief shows on Telegram
@@ -543,6 +576,11 @@ class Config:
         mail_telegram = (_env("PA_MAIL_TELEGRAM", "counts") or "counts").lower()
         if mail_telegram not in MAIL_TELEGRAM_MODES:
             raise ConfigError("PA_MAIL_TELEGRAM must be 'off', 'counts', 'subjects' or 'full'")
+        web_port = _env_int("PA_WEB_PORT", 8788)
+        if not 1 <= web_port <= 65535:
+            raise ConfigError("PA_WEB_PORT must be between 1 and 65535")
+        trusted_proxies = _parse_trusted_clients(_env("PA_TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES),
+                                                 "PA_TRUSTED_PROXIES")
 
         return cls(
             state_dir=state_dir,
@@ -582,6 +620,10 @@ class Config:
             ntfy_token=ntfy_token,
             ntfy_inbound=ntfy_inbound,
             chat_devices=chat_devices,
+            web_enabled=_env_bool("PA_WEB", False),
+            web_port=web_port,
+            web_origin=_parse_web_origin(_env("PA_WEB_ORIGIN")),
+            trusted_proxies=trusted_proxies,
             public_approval_url=public_approval_url,
             approval_pin=approval_pin,
             trusted_clients=_parse_trusted_clients(_env("PA_TRUSTED_CLIENTS")),
@@ -646,6 +688,11 @@ class Config:
             # With Telegram, turns that start in Telegram always ask there: level 3 must be
             # deniable safely, so the PIN is required as soon as the token is set.
             validate_pin(self.approval_pin, "PA_APPROVAL_PIN")
+        if self.web_enabled:
+            if not self.web_origin:
+                raise ConfigError("PA_WEB=on needs PA_WEB_ORIGIN (the https:// address the app is opened at)")
+            if self.web_port == self.port:
+                raise ConfigError("PA_WEB_PORT must differ from PA_PORT: the web listener has its own port")
 
 
 def validate_pin(pin: str | None, name: str = "PA_CALL_PIN") -> None:

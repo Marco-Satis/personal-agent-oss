@@ -13,6 +13,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+web = ["cryptography>=44,<51"]  # only the web app (passkeys, web push); the core stays standard library
 
 [project.scripts]
 personal-agent = "personal_agent.cli:main"

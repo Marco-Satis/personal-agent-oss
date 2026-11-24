@@ -540,6 +540,26 @@ personal-agent devices list | revoke iphone
 
 Step-by-step shortcut: [docs/PHONE-SHORTCUT.md](docs/PHONE-SHORTCUT.md).
 
+### Web app (in progress)
+
+The browser app gets its own listener, so the internal routes (`/escalate`, `/internal/`) simply do not
+exist on the port a proxy can reach. Off by default; for now it serves health, session state, the
+approval page, the Twilio webhooks and `/chat`, and answers 401 on every route that will need a sign-in.
+
+```
+pip install 'personal-agent[web]'                 # cryptography, for passkeys and web push later
+PA_WEB=on
+PA_WEB_PORT=8788                                  # its own port, never PA_PORT
+PA_WEB_ORIGIN=https://<machine>.<tailnet>.ts.net:8788   # the address you open, byte for byte
+tailscale serve --bg --https=8788 http://127.0.0.1:8788
+```
+
+Every answer carries a content security policy, `nosniff`, a same-origin referrer and opener policy and,
+for an https origin, HSTS. At most 32 requests run at once; more get `503` at once. The client address
+comes from `X-Forwarded-For` only when the request arrives from a proxy in `PA_TRUSTED_PROXIES`
+(default `127.0.0.1,::1`, which covers `tailscale serve` and a local Caddy), and then from its rightmost
+entry that is not a proxy.
+
 ### Telegram
 
 A Telegram bot brings the agent to your phone: notices, approvals with buttons, and a chat with the same

@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import Config
+from .config import Config, ConfigError
 from .conversation import Call, CallRegistry
 from .devchat import WAIT_S
 from .escalation import EscalationPolicy, Event
@@ -602,6 +602,11 @@ def start_rhythm_thread(config: Config, stop: threading.Event,
 
 def serve(config: Config) -> None:
     config.validate_for_serve()
+    if config.web_enabled:
+        import importlib.util
+
+        if importlib.util.find_spec("cryptography") is None:  # passkeys and web push need it (U-E6)
+            raise ConfigError("PA_WEB=on needs the optional dependency: pip install 'personal-agent[web]'")
     if not config.escalation_enabled:
         log.info("phone escalation is off (PA_CALL_TO and PA_CALL_PIN not set); alerts still go to the notice channels")
     if not config.api_token:
@@ -643,6 +648,11 @@ def serve(config: Config) -> None:
     from .devchat import start_device_chat
 
     agent.device_chat = start_device_chat(config)
+    web_server = None
+    if config.web_enabled:
+        from .web.listener import start_web_listener
+
+        web_server, _ = start_web_listener(agent)
 
     def on_sigterm(_signum: int, _frame: object) -> None:
         # serve_forever runs in this (main) thread: shutdown() must come from another one.
@@ -658,6 +668,9 @@ def serve(config: Config) -> None:
         pass
     finally:
         stop.set()
+        if web_server is not None:
+            web_server.shutdown()
+            web_server.server_close()
         if telegram is not None:
             telegram.close(join_s=8.0)
         if ntfy_inbox is not None:
